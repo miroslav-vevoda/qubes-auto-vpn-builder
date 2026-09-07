@@ -2,8 +2,7 @@
 
 Automatically generate a firewalled, disposable VPN qube in Qubes OS from a
 single config choice — protocol, MTU, and a country or specific server — with
-your VPN provider's key material kept in a qube the automation itself never
-has to touch.
+a two-layer kill switch that fails closed when the tunnel drops.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design rationale: the trust
 boundaries between the qubes, both firewall layers in full, the build-time and
@@ -60,28 +59,51 @@ understanding before anything else.
 Three consequences, each of which explains a chunk of the rest of this
 document:
 
-**Your keys live somewhere with no network.** `vpn-config-files-vm` has
-`netvm = none`, so nothing in it can reach the internet even if the qube is
-compromised. That is also why the endpoint map has to be built *before* the
-configs get there (see below) — there is no DNS in that qube, ever.
+### What the split is not
 
-**dom0 never sees the key material.** At build time dom0 tells
-`vpn-config-files-vm` to send the config *directly* to the VPN qube. dom0
-orchestrates a transfer between two other qubes without the contents passing
-through it. The qrexec policy in `30-vpn.policy` keys on a tag that only dom0
-can set, so `vpn-config-files-vm` cannot be tricked into sending your keys to
-some other qube.
+**It is not protection from dom0.** dom0 is the most privileged thing on the
+machine and can read anything in any qube — one `qvm-run --pass-io
+vpn-config-files-vm 'cat …'` and it has your private keys. `netvm = none`
+constrains the *network*, not dom0. Nothing here changes that, and no design
+on Qubes can.
 
-**The file you edit is not where your secrets are.** Choosing a country is a
-routine, frequent act; handling private keys is not. Keeping them in
-different qubes means the thing you touch often is not the thing that would
-hurt you to lose.
+So the split is not a claim that your keys are safe from the automation. It is
+a set of defences against everything that *isn't* dom0:
 
-The guiding threat model is narrower than "keep secrets secret": the concern
-is **dom0 being compromised**. dom0 is the most privileged thing on the
-machine, so the design minimises what flows *into* it — which is why the only
-code that crosses that boundary does so as a signed, audited package, and why
-`vpn-rpm-audit` exists at all.
+**A compromised config qube cannot exfiltrate.** `vpn-config-files-vm` has
+`netvm = none`, so even if something in it is malicious — a tampered config, a
+bad download — it has no route out. This is also why the endpoint map must be
+built *before* the configs land there: that qube has no DNS, ever.
+
+**Another qube cannot ask for your keys.** The qrexec policy in
+`30-vpn.policy` scopes the copy by a **tag that only dom0 can set**, so
+`vpn-config-files-vm` will only ever send files to the qube dom0 just tagged.
+A second compromised qube cannot request them, and cannot name itself as the
+destination.
+
+**The keys are not in dom0's filesystem.** dom0 *could* read them, but as
+built it never stores or relays them — it triggers a direct qube-to-qube
+transfer. That keeps them out of dom0's disk, logs and swap, which reduces
+accidental exposure rather than adversarial exposure. A real but modest
+benefit, and worth stating as the modest thing it is.
+
+**The file you edit is not where your secrets are.** Choosing a country is
+routine and frequent; handling private keys is not. Separating them means the
+thing you touch weekly is not the thing that would hurt you to lose.
+
+### The actual threat model
+
+The concern is **dom0 being compromised**, not secrecy. Since dom0 can already
+read every secret on the machine, protecting secrets *from* it is not a goal
+worth pursuing — the goal is to minimise what flows *into* it, because that is
+the only direction that can make dom0 worse than it already is.
+
+That is what the rest of this design is about, and it is why the security
+effort is concentrated somewhere that looks unrelated: the only code that ever
+crosses into dom0 does so as a signed package whose structure has been audited
+in a disposable build qube (`tools/rpm/vpn-rpm-audit`), and the only thing
+crossing per build is a dozen `key=value` lines parsed against a fixed
+whitelist.
 
 ## Using it
 
@@ -221,7 +243,9 @@ You type one command in dom0: `vpn-build`. In order:
    delivered, so there's never a moment where the qube is open.
 6. **Deliver the actual VPN config.** Only now does dom0 tell
    `vpn-config-files-vm` to send the real config — including its private key
-   — directly to the VPN qube. dom0 never sees its contents.
+   — directly to the VPN qube. The contents do not pass through dom0, which
+   keeps them out of its disk and logs; it is not a barrier against dom0
+   itself, which could read them regardless.
 7. **Secure what was delivered.** The files are moved out of the inbox into
    root-owned `0700` storage at `0600` each, and the template is shut back
    down.

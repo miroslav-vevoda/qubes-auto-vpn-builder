@@ -99,9 +99,21 @@ differently:
   line, including rejecting octets with leading zeros — `010.0.0.1` is
   parsed as octal by some tools and must never be passed on as if it were
   unambiguous.
-- **Secrets** — the provider `.conf` files. These never touch dom0's
-  filesystem at all. dom0 tags the destination qube, then tells
-  `vpn-config-files-vm` to copy the file directly to it:
+- **Secrets** — the provider `.conf` files.
+
+  State the limit first, because it is easy to read more into this than is
+  there: **none of it protects the keys from dom0.** dom0 can run
+  `qvm-run --pass-io vpn-config-files-vm 'cat …'` whenever it likes and read
+  every private key on the machine. `netvm = none` constrains the network, not
+  dom0. That is not a gap to be closed — it is what dom0 *is* — and since
+  dom0 already has every secret, protecting secrets from it is not a goal this
+  design pursues. What it defends against is everything that is not dom0: a
+  compromised config qube (no network route out), and any other qube trying to
+  request the keys (tag-scoped policy, below).
+
+  With that said: the `.conf` files never touch dom0's filesystem. dom0 tags
+  the destination qube, then tells `vpn-config-files-vm` to copy the file
+  directly to it:
 
   ```sh
   qvm-tags nordvpn-uk123-vpn-dvm add vpn-endpoint
@@ -367,7 +379,8 @@ Running `vpn-build` in dom0:
    before the actual config file is delivered, so there's no window where
    it's open.
 6. **Deliver the config files** (plus `endpoint-map.txt`) via the tagged
-   qube-to-qube copy in §2. dom0 never sees the config contents.
+   qube-to-qube copy in §2. The contents do not pass through dom0 — see §2 for
+   what that does and does not buy.
 7. **Secure the delivered files** — move them out of the template's
    `~/QubesIncoming` into root-owned `0700` storage at `0600`, then shut the
    template back down, since the copy is what started it.
