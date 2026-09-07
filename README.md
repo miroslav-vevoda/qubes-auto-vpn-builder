@@ -16,8 +16,7 @@ projects.
 - [The qubes involved](#the-qubes-involved)
 - [Using it](#using-it) — the four steps, briefly
 - [Step 1 in detail: preparing your provider's configs](#step-1-in-detail-preparing-your-providers-configs) — the endpoint map
-- [What happens when you run the build](#what-happens-when-you-run-the-build)
-- [What happens every time the VPN qube boots](#what-happens-every-time-the-vpn-qube-boots)
+- [What happens when you run the build](#what-happens-when-you-run-the-build) — the full flow, build through first start
 - [Repository layout](#repository-layout)
 - [Install order](#install-order) — the commands
 - [Building several qubes](#building-several-qubes) — chaining
@@ -237,46 +236,113 @@ configs back out to a networked qube — so it is worth getting right once.
 
 ## What happens when you run the build
 
-You type one command in dom0: `vpn-build`. In order:
+You type one command in dom0: `vpn-build`. What follows is the whole flow,
+from that command to a disposable you can point other qubes at.
 
-1. **Read your choice, check it's sane.** dom0 reads the settings file
-   (protocol, MTU, which server) and checks every value against a strict
-   pattern before using it — e.g. the country code must be exactly two
-   lowercase letters. Anything that doesn't match aborts the build rather
-   than guessing.
-2. **Create the qubes.** dom0 derives qube names from your choice (e.g.
-   `uk123` → `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`), then creates a
-   plain AppVM template with no network connection of its own, and a named
-   disposable based on it that does get a connection — the one you actually
-   use.
-3. **Install the scripts into the template**, so every disposable spun up
-   from it inherits them.
-4. **Fetch the list of VPN server addresses** for the chosen country from
-   `vpn-config-files-vm`, validating every line looks like a real IP/port
-   before using it.
-5. **Lock down the firewall (Layer 2) — before anything else happens.** The
-   VPN qube is restricted to only ever reach the whitelisted server addresses,
-   on the right port and protocol. This happens *before* the config file is
-   delivered, so there's never a moment where the qube is open.
-6. **Deliver the actual VPN config.** Only now does dom0 tell
-   `vpn-config-files-vm` to send the real config — including its private key
-   — directly to the VPN qube. The contents do not pass through dom0, which
-   keeps them out of its disk and logs; it is not a barrier against dom0
-   itself, which could read them regardless.
-7. **Secure what was delivered.** The files are moved out of the inbox into
-   root-owned `0700` storage at `0600` each, and the template is shut back
-   down.
+### Two qubes get created, and they are different things
 
-## What happens every time the VPN qube boots
+Worth being clear about this up front, because the names are similar and the
+roles are not:
 
-Because it's a disposable, this runs fresh every time:
+- **`<provider>-<sel>-vpn-dvm`** — an **AppVM**, created from your base
+  template, with `template_for_dispvms` set. That flag is what makes it usable
+  as a disposable template. It has `netvm = none` and **it never runs**. It
+  exists to hold the scripts and configs that every disposable spun from it
+  inherits.
+- **`<provider>-<sel>-vpn`** — a **named DispVM** whose template is the AppVM
+  above. This is the one that actually runs, holds the live tunnel, and serves
+  as `netvm` for your other qubes.
 
-1. Picks a config — the specific server you chose, or a random one from the
-   country you chose.
-2. Brings up the tunnel (WireGuard or OpenVPN).
-3. Applies the firewall / kill-switch rules (see Architecture).
-4. Sets the correct MTU on downstream qubes so packets fit inside the
-   tunnel's overhead.
+It is a *named* disposable rather than an ad-hoc `disp####` precisely so other
+qubes can reference it by name. Its root filesystem is discarded and recreated
+from the template on every start; only the private volume persists, which is
+why an explicit `qvm-prefs` value on it survives resets.
+
+### The build, in order
+
+1. **Read your choice and validate it.** `vpn-params-fetch` pulls the settings
+   file from `salt-configs-vm` and checks every value against a strict pattern
+   — protocol must be `wireguard` or `openvpn`, transport `udp` or `tcp`, MTU
+   within `[1280, 1500]`, the selector `^[a-z]{2}([0-9]{1,4})?$`. Anything that
+   doesn't match aborts the build rather than falling back to a default. The
+   validated values are written to dom0's pillar, which is how they reach the
+   salt states.
+2. **Derive the names and create both qubes.** `uk123` becomes
+   `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`. The AppVM template gets
+   `netvm = none`, `provides_network`, the `vpn-endpoint` tag, the
+   `qubes-firewall` service enabled and `network-manager` disabled. The
+   disposable gets `netvm` set to whatever you chose as `uplink`,
+   `provides_network`, `autostart false`, and the same tag.
+3. **Install the scripts into the template.** `vpn-up`, `rc.local`, the
+   firewall script, the MTU hook and the rendered `vpn-params` file are placed
+   inside the AppVM template, so every disposable started from it has them
+   already. This step runs through the management disposable rather than dom0.
+4. **Fetch the endpoint list.** dom0 asks `vpn-config-files-vm` for the
+   `endpoint-map.txt` lines for your country and validates each one is a real
+   IP and port — including rejecting octets with leading zeros — before any of
+   it reaches a firewall command.
+5. **Lock down the firewall (Layer 2) first.** The disposable is restricted to
+   the whitelisted server addresses on the right transport and port, with DNS
+   and ICMP dropped and a terminal `drop`. This happens *before* any config
+   arrives, so there is never a window in which the qube has key material and
+   an open firewall.
+6. **Deliver the configs.** Only now does dom0 tell `vpn-config-files-vm` to
+   copy the real configs — private keys included — directly to the template.
+   **How many depends on what you asked for:** name a specific server
+   (`uk123`) and exactly one config is sent; name a country (`uk`) and *all*
+   of that country's configs are sent. The endpoint map travels with them, and
+   `auth-user-pass.txt` too if your provider needs credentials. The contents
+   don't pass through dom0, which keeps them out of its disk and logs — not a
+   barrier against dom0 itself, which could read them regardless.
+7. **Secure what arrived and shut the template down.** The files are moved out
+   of `~/QubesIncoming` into root-owned `0700` storage at `0600` each, and the
+   template — which the file copy had started — is shut back down.
+
+At this point nothing is running. The build is a build; it deliberately starts
+nothing.
+
+### Then you start it
+
+```sh
+qvm-start <provider>-<sel>-vpn
+```
+
+The disposable boots with a fresh root filesystem from the template, and:
+
+1. **The kill switch goes up before the tunnel exists.** The
+   `qubes-firewall` service runs `qubes-firewall-user-script`, which installs
+   the Layer 1 nftables rules. With no tunnel interface yet, the chain is
+   kill-switch-only — nothing can pass through this qube.
+2. **`rc.local` runs `vpn-up`, which selects a config.** If you named a
+   specific server there is one config and it is used. If you named a country,
+   one is picked at random from those delivered — which is safe because step 5
+   whitelisted *every* endpoint in that country, so any choice is already
+   covered by the firewall.
+3. **The endpoint comes from the map, not the config.** `vpn-up` looks up the
+   chosen config's whitelisted `IP:PORT` in `endpoint-map.txt`, so the tunnel
+   can only be aimed somewhere the firewall already permits. For WireGuard it
+   warns if the config's own `Endpoint` disagrees; for OpenVPN it rewrites
+   `remote` to the whitelisted address, because DNS is dropped and a hostname
+   could never resolve.
+4. **The tunnel comes up**, with the MTU you chose injected, and the interface
+   name pinned rather than guessed — WireGuard configs are installed under a
+   fixed name because the kernel caps interface names at 15 characters and a
+   provider filename easily exceeds it.
+5. **The firewall script re-runs now the tunnel is real**, so its accept rules
+   name the live interface. If the interface never appears within 30 seconds,
+   `vpn-up` reapplies the kill switch and exits — the qube stays closed rather
+   than falling open.
+6. **Downstream MTU is set** by the `90-vif-mtu` hook as other qubes attach,
+   so their packets fit inside the tunnel's overhead.
+
+Now point other qubes at it:
+
+```sh
+qvm-prefs <some-qube> netvm <provider>-<sel>-vpn
+```
+
+Every subsequent start repeats steps 1–6 from scratch. Nothing accumulates in
+the disposable, and a broken tunnel is fixed by restarting it.
 
 ## Repository layout
 
