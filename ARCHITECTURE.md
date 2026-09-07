@@ -177,9 +177,11 @@ Two qubes are created per selection:
 - **The dvm template** (`…-vpn-dvm`) — a plain AppVM, `netvm = none`,
   `provides_network = true`, `template_for_dispvms = true`, tagged
   `vpn-endpoint`. It never runs on its own; it exists purely so the
-  disposable below can be spun up from it. `netvm = none` here is the
-  fail-closed default — anything created from this template without an
-  explicit override gets no uplink at all.
+  disposable below can be spun up from it. Its `netvm = none` is written
+  literally into `dvmtemplate.sls` and is **not** derived from the `uplink=`
+  setting — that setting applies only to the disposable. Hardcoding it is the
+  fail-closed default: anything created from this template without an explicit
+  override gets no network path at all.
 - **The named disposable** (`…-vpn`) — created from that template, with
   `netvm` and `provides_network` set explicitly:
 
@@ -199,10 +201,10 @@ Two qubes are created per selection:
   not by the qube itself. `sys-firewall` qualifies, and so does another VPN
   qube's disposable (an AppVM with `provides_network true`). Pointing the
   uplink straight at `sys-net` would leave the Layer 2 rules in §4
-  unenforced, which is why the example above names `sys-firewall`. With
-  `uplink=none` there is no netvm at all, so those rules are configured but
-  inert until the qube is attached. Layer 1, inside the qube, is unaffected
-  either way.
+  unenforced, which is why the example above names `sys-firewall`. Setting
+  `uplink=none` leaves the disposable with no netvm, so those rules are
+  configured but inert until one is attached. Layer 1, inside the qube, is
+  unaffected either way.
 
   The disposable is also tagged `vpn-endpoint`, so the policy denying file
   copies out of tagged qubes covers it.

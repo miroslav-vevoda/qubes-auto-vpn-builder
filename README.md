@@ -95,7 +95,7 @@ to follow:
 | **dom0** | the build commands and the salt states | none, as always |
 | **`salt-configs-vm`** | the settings file you edit, and an authoring copy of the salt states | normal |
 | **`vpn-config-files-vm`** | your provider's configs and keys | `netvm = none` |
-| *(generated)* `<provider>-<sel>-vpn-dvm` | the DVM template — created for you | none |
+| *(generated)* `<provider>-<sel>-vpn-dvm` | the DVM template — created for you | `none`, fixed |
 | *(generated)* `<provider>-<sel>-vpn` | the disposable you actually use | whatever you set `uplink=` to |
 
 The practical reasons for the split: your provider's configs sit in an offline
@@ -246,12 +246,14 @@ roles are not:
 
 - **`<provider>-<sel>-vpn-dvm`** — an **AppVM**, created from your base
   template, with `template_for_dispvms` set. That flag is what makes it usable
-  as a disposable template. It has `netvm = none` and **it never runs**. It
+  as a disposable template. Its `netvm` is fixed at `none` — hardcoded in
+  `dvmtemplate.sls`, not something you configure — and **it never runs**. It
   exists to hold the scripts and configs that every disposable spun from it
   inherits.
 - **`<provider>-<sel>-vpn`** — a **named DispVM** whose template is the AppVM
   above. This is the one that actually runs, holds the live tunnel, and serves
-  as `netvm` for your other qubes.
+  as `netvm` for your other qubes. Its own `netvm` is the one setting you
+  control here, via `uplink=` in the settings file.
 
 It is a *named* disposable rather than an ad-hoc `disp####` precisely so other
 qubes can reference it by name. Its root filesystem is discarded and recreated
@@ -269,10 +271,11 @@ why an explicit `qvm-prefs` value on it survives resets.
    salt states.
 2. **Derive the names and create both qubes.** `uk123` becomes
    `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`. The AppVM template gets
-   `netvm = none`, `provides_network`, the `vpn-endpoint` tag, the
-   `qubes-firewall` service enabled and `network-manager` disabled. The
-   disposable gets `netvm` set to whatever you chose as `uplink`,
-   `provides_network`, `autostart false`, and the same tag.
+   `netvm = none` unconditionally, plus `provides_network`, the `vpn-endpoint`
+   tag, the `qubes-firewall` service enabled and `network-manager` disabled.
+   The disposable gets the same tag, `provides_network`, `autostart false`,
+   and — the one value taken from your settings file — `netvm` set to the qube
+   your `uplink=` named.
 3. **Install the scripts into the template.** `vpn-up`, `rc.local`, the
    firewall script, the MTU hook and the rendered `vpn-params` file are placed
    inside the AppVM template, so every disposable started from it has them
@@ -598,12 +601,12 @@ N  drop                                                         (no address fami
 
 The qube may reach the VPN server and nothing else.
 
-**Enforcement happens in the qube's netvm, not in the qube.** So whatever
-`uplink=` names has to be a qube that runs the Qubes firewall service.
+**Enforcement happens in the qube's netvm, not in the qube.** So the qube your
+`uplink=` names has to be one that runs the Qubes firewall service.
 `sys-firewall` does; a chained VPN qube does, since it is an AppVM with
-`provides_network true`; `sys-net` generally does not, which is why the uplink
-should not point straight at it. With `uplink=none` there is no netvm at all,
-so these rules are configured but inert until the qube is attached.
+`provides_network true`; `sys-net` generally does not, which is why you should
+not point `uplink=` straight at it. Write `uplink=none` and the disposable has
+no netvm, so these rules are configured but inert until you attach one.
 
 Three further consequences worth knowing:
 
@@ -617,24 +620,30 @@ Three further consequences worth knowing:
 ## Verify after build
 
 ```sh
-qvm-prefs <dvm-template> netvm            # blank (none) — always
-qvm-prefs <disposable> netvm              # whatever you set uplink= to
+qvm-prefs <dvm-template> netvm            # blank — hardcoded, not configurable
+qvm-prefs <disposable> netvm              # the qube named by uplink=, or blank
 qvm-prefs <disposable> provides_network   # True
 qvm-tags  <dvm-template> list             # vpn-endpoint
 qvm-tags  <disposable> list               # vpn-endpoint
 qvm-firewall <disposable> list            # last rule is an unconditional drop
 ```
 
-The disposable's `netvm` should match your `uplink=` value exactly — normally
-`sys-firewall`, another VPN qube's disposable if you are chaining, or blank if
-you set `uplink=none` and intend to attach it by hand later. If it is blank
-and you did *not* ask for `none`, the pillar did not reach `dispvm.sls`; check
-the `'*-vpn-dvm'` glob in `srv/user_pillar/top.sls`.
+Two different things are being checked there, and only one of them is yours to
+set:
 
-Note that `uplink=none` means the Layer 2 (`qvm-firewall`) rules are in place
-but **not yet enforced by anything** — those rules are applied by a qube's
-netvm, and this qube has none. They take effect when you attach it. Layer 1,
-inside the qube, is unaffected and works regardless.
+- **The template's `netvm` is always blank.** `dvmtemplate.sls` sets it to
+  `none` unconditionally, and `uplink=` has no bearing on it. If this is not
+  blank, something is wrong.
+- **The disposable's `netvm` is the qube your `uplink=` named.** It should
+  match exactly — normally `sys-firewall`, or another VPN qube's disposable if
+  you are chaining. It is blank only if you wrote `uplink=none`. If it is
+  blank and you did *not* write that, the pillar never reached `dispvm.sls`;
+  check the `'*-vpn-dvm'` glob in `srv/user_pillar/top.sls`.
+
+If you did write `uplink=none`, the Layer 2 (`qvm-firewall`) rules are in
+place but **not yet enforced by anything** — those rules are applied by a
+qube's netvm, and this one has none. They take effect when you attach it.
+Layer 1, inside the qube, is unaffected and works regardless.
 
 In the disposable:
 
