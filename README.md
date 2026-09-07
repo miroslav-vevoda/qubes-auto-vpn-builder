@@ -1,4 +1,4 @@
-# Qubes VPN Build
+# Qubes Auto VPN Builder
 
 Automatically generate a firewalled, disposable VPN qube in Qubes OS from a
 single config choice — protocol, MTU, and a country or specific server — with
@@ -8,6 +8,21 @@ has to touch.
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design rationale, the bugs
 in the original concept it fixes, and external validation against Qubes docs
 and community projects.
+
+**Contents**
+
+- [What this is for](#what-this-is-for)
+- [The three qubes, and why they are separate](#the-three-qubes-and-why-they-are-separate) — read this first
+- [Using it](#using-it) — the four steps, briefly
+- [Step 1 in detail: preparing your provider's configs](#step-1-in-detail-preparing-your-providers-configs) — the endpoint map
+- [What happens when you run the build](#what-happens-when-you-run-the-build)
+- [What happens every time the VPN qube boots](#what-happens-every-time-the-vpn-qube-boots)
+- [Repository layout](#repository-layout)
+- [Install order](#install-order) — the commands
+- [Building several qubes](#building-several-qubes) — chaining
+- [The two firewalls](#the-two-firewalls) — how the kill switch works
+- [Verify after build](#verify-after-build)
+- [Status: verified vs. assumed](#status-verified-vs-assumed) — what is actually tested
 
 ---
 
@@ -28,19 +43,156 @@ That's the whole point: making a correctly-configured VPN qube something you
 generate on demand instead of something you hand-build and are then
 reluctant to touch again.
 
+## The three qubes, and why they are separate
+
+Almost every design decision here follows from one split, so it is worth
+understanding before anything else.
+
+| Qube | Holds | Network |
+|---|---|---|
+| **dom0** | the build commands and the salt states | none, as always |
+| **`salt-configs-vm`** | the settings file you edit, and an authoring copy of the salt states | normal |
+| **`vpn-config-files-vm`** | your provider's configs, **including private keys** | **`netvm = none`** |
+| *(generated)* `<provider>-<sel>-vpn-dvm` + `-vpn` | the template and the disposable you actually use | via `sys-firewall` |
+
+Three consequences, each of which explains a chunk of the rest of this
+document:
+
+**Your keys live somewhere with no network.** `vpn-config-files-vm` has
+`netvm = none`, so nothing in it can reach the internet even if the qube is
+compromised. That is also why the endpoint map has to be built *before* the
+configs get there (see below) — there is no DNS in that qube, ever.
+
+**dom0 never sees the key material.** At build time dom0 tells
+`vpn-config-files-vm` to send the config *directly* to the VPN qube. dom0
+orchestrates a transfer between two other qubes without the contents passing
+through it. The qrexec policy in `30-vpn.policy` keys on a tag that only dom0
+can set, so `vpn-config-files-vm` cannot be tricked into sending your keys to
+some other qube.
+
+**The file you edit is not where your secrets are.** Choosing a country is a
+routine, frequent act; handling private keys is not. Keeping them in
+different qubes means the thing you touch often is not the thing that would
+hurt you to lose.
+
+The guiding threat model is narrower than "keep secrets secret": the concern
+is **dom0 being compromised**. dom0 is the most privileged thing on the
+machine, so the design minimises what flows *into* it — which is why the only
+code that crosses that boundary does so as a signed, audited package, and why
+`vpn-rpm-audit` exists at all.
+
 ## Using it
 
-1. Organize your VPN provider's config files one folder per country code, run
-   `tools/build-endpoint-map.sh` over them in the qube you downloaded them in,
-   then copy the whole tree into `vpn-config-files-vm`.
-2. Edit one settings file in `salt-configs-vm`: pick WireGuard or OpenVPN, a
+1. **Prepare your provider's configs.** Sort them one folder per country code,
+   run `tools/build-endpoint-map.sh` over them *in the networked qube you
+   downloaded them in*, then copy the tree into `vpn-config-files-vm` and take
+   it offline. Detail in the next section — this is the only fiddly step.
+2. **Edit one settings file** in `salt-configs-vm`: WireGuard or OpenVPN, a
    transport (`udp`/`tcp`), an MTU, and a country or specific server.
-3. In dom0, run the install/build commands (see **Install order**, below).
-4. Start the resulting disposable qube, and point your other qubes at it as
-   their network source.
+3. **In dom0, run the build** (see **Install order**, below).
+4. **Use it** — start the disposable and point other qubes at it as their
+   network source.
 
 Everything else — naming, firewall rules, config delivery, kill switch — is
 automatic from there.
+
+## Step 1 in detail: preparing your provider's configs
+
+This is the one step that needs thought, and the one most likely to bite you
+later if rushed. Everything after it is automatic.
+
+### What you start with
+
+A download from your VPN provider: anywhere from a handful to several hundred
+`.conf` files, one per server. Sort them into **one folder per two-letter
+lowercase country code**, and name each file `<stem>.<provider>.<tld>.conf`
+where the stem is two letters plus one to four digits:
+
+```
+~/configs/
+  uk/
+    uk123.mullvad.net.conf
+    uk124.mullvad.net.conf
+  de/
+    de77.mullvad.net.conf
+```
+
+The stem (`uk123`) is what you will later put in your settings file to pick a
+specific server, and it becomes part of the generated qube's name. Files that
+don't match the pattern are skipped by dom0, so the script warns you about
+them up front rather than letting a server go quietly missing.
+
+### Then run the endpoint map builder
+
+```sh
+tools/build-endpoint-map.sh ~/configs
+```
+
+**Run it in the networked qube where you downloaded the configs — before
+copying anything into `vpn-config-files-vm`.**
+
+### Why this is a separate step
+
+Because it needs DNS, and this is the only moment in the entire workflow that
+has any:
+
+- `vpn-config-files-vm` has `netvm = none`
+- dom0 has no network at all
+- the VPN qube has DNS **dropped** by the `qvm-firewall` rules dom0 applies to
+  it (layer 1 under [The two firewalls](#the-two-firewalls))
+
+Your provider's configs usually name servers by hostname
+(`Endpoint = uk123.mullvad.net:51820`). But the firewall that locks the VPN
+qube down has to be written in terms of **IP addresses** — you cannot
+whitelist a name you have no way to resolve. So every hostname is resolved
+once, here, at gathering time, and the answers are written down.
+
+That's the whole reason this script exists on its own.
+
+### What it produces
+
+An `endpoint-map.txt` in each country folder:
+
+```
+# Generated by build-endpoint-map.sh on 2026-09-07 14:22 UTC
+# <config-filename> <ip>:<port>   -- hostnames already resolved
+uk123.mullvad.net.conf 193.32.249.66:51820
+uk124.mullvad.net.conf 193.32.249.67:51820
+```
+
+That file is the *only* thing dom0 ever reads out of `vpn-config-files-vm`.
+It contains no key material — just which server is at which address — which
+is what lets dom0 build the firewall without ever touching your keys.
+
+### What it checks, and why
+
+- **Rejects addresses with a leading zero.** `010.0.0.1` is read as octal by
+  some tools and decimal by others; whitelisting it would open a hole to an
+  address nobody chose. Anything numeric-but-malformed is refused outright
+  rather than resolved — `getent` would cheerfully turn `010.0.0.1` into
+  `8.0.0.1` and the firewall would then permit a completely different server.
+- **Refuses IPv6.** This design is IPv4-only by choice: `qvm-firewall` gets
+  `dst4` rules and the VPN qube has IPv6 disabled.
+- **Writes via a temp file and `mv`.** An interrupted run never leaves a
+  half-built map that a later build would read as authoritative.
+- **Warns when a hostname has several addresses** and tells you which one it
+  pinned.
+
+One warning deserves special attention:
+
+> `! uk123…conf - WireGuard Endpoint is a hostname.`
+
+`wg-quick` resolves `Endpoint` *itself*, inside the VPN qube — where there is
+no DNS. The map fixes the firewall but cannot fix the config, so for WireGuard
+you must also edit the `.conf` to use the literal address the script prints.
+The script tells you the exact line to write.
+
+### Then move it across
+
+Copy the whole tree into `vpn-config-files-vm` at `/home/user/configs/`, and
+from dom0 set `qvm-prefs vpn-config-files-vm netvm none`. From that point on
+the qube is offline permanently, and re-running the map means bringing the
+configs back out to a networked qube — so it is worth getting right once.
 
 ## What happens when you run the build
 
@@ -150,6 +302,8 @@ which none of the three above has. `tools/rpm/` runs in the build qube, and
    one folder per country code and run `tools/build-endpoint-map.sh ~/configs`.
    This resolves any hostnames and writes `endpoint-map.txt` into each folder.
    It has to happen here — it's the only step in the whole workflow with DNS.
+   Full explanation in **Step 1 in detail**, above; read it before you run
+   this, particularly if you use WireGuard with hostname endpoints.
 3. **In `vpn-config-files-vm`:** copy `etc/qubes-rpc/*` to `/etc/qubes-rpc/`
    (mode 755, root:root); copy the whole `configs/` tree from step 2 into
    `/home/user/configs/`; from dom0,

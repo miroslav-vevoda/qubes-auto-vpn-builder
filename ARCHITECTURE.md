@@ -1,6 +1,6 @@
 # Architecture
 
-How the Qubes VPN Build system is put together and why.
+How Qubes Auto VPN Builder is put together and why.
 
 **Purpose:** turn setting up a VPN qube in Qubes OS — normally a manual,
 one-off job — into a single config edit and one command in dom0, producing
