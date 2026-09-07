@@ -262,6 +262,93 @@ The 1280 MTU floor puts a practical limit of about three WireGuard hops on a
 1500-byte uplink. Past that, `vpn-build-all` says the chain is too long
 rather than suggesting an MTU the validator would reject.
 
+## The two firewalls
+
+There are two, they run in different places, and neither is sufficient alone.
+Confusing them is the easiest way to think you are protected when you are not.
+
+| | `qvm-firewall` | nftables `custom-forward` |
+|---|---|---|
+| Set by | `vpn-firewall-apply`, in dom0 | `qubes-firewall-user-script`, in the qube |
+| Enforced by | `sys-firewall` (the disposable's netvm) | the VPN qube itself |
+| Governs | traffic the VPN qube **originates** | traffic that **passes through** the qube |
+| Stops | the qube talking to anything but the VPN server | downstream qubes leaking to the clear |
+| If the tunnel drops | unaffected — it never saw tunnel traffic | **this is the kill switch** |
+
+The split matters because each is blind to the other's job. `qvm-firewall`
+sees the VPN qube as a single endpoint and cannot distinguish a downstream
+qube's packet from the qube's own. `custom-forward` only sees the forward
+hook, so the tunnel handshake — which the qube originates — never passes
+through it at all.
+
+### Layer 1 — `qvm-firewall`, on the *named disposable*
+
+Applied by `vpn-firewall-apply` to the running disposable, never the template
+(a template with `netvm = none` filters nothing). Final order:
+
+```
+0  drop specialtarget=dns
+1  drop proto=icmp
+2  accept proto=<udp|tcp> dst4=<endpoint-ip> dstports=<port>   (one per endpoint)
+…
+N  drop                                                         (no address family)
+```
+
+The qube may reach the VPN server and nothing else. Three consequences worth
+knowing:
+
+- **DNS is dropped deliberately**, so the qube cannot resolve hostnames. That
+  is why `vpn-up` rewrites an OpenVPN `remote` to the whitelisted IP rather
+  than leaving a hostname in the config.
+- **The trailing `drop` carries no address family**, so it covers IPv6 too.
+- `vpn-firewall-apply` **asserts** the last rule is a drop rather than just
+  printing the list, and exits non-zero if it is not.
+
+### Layer 2 — nftables `custom-forward`, inside the qube
+
+Loaded at firewall-service start, before per-qube rules are inserted, so the
+chains are guaranteed to exist. Both `ip` and `ip6` get the identical ruleset
+unconditionally — the ip6 chain exists even with IPv6 off, so if IPv6 is ever
+enabled the kill switch already covers it.
+
+```
+1  tcp syn → clamp MSS to path MTU          (tunnel overhead)
+2  iifgroup 2  oifname <tun>        accept  downstream → tunnel
+3  iifname <tun>  oifgroup 2  ct established,related accept
+4  iifname <tun>  oifname eth0     accept   tunnel → outside (already encrypted)
+5  iifgroup 2  oifname eth0        drop     downstream → uplink: the leak
+6  oifname eth0                    drop     kill switch
+7  (bare)                          drop     catch-all
+```
+
+`iifgroup 2` means "arrived from a qube using this one as its netvm". Four
+design points, each of which is load-bearing:
+
+- **Every `accept` names the tunnel interface.** When the tunnel is down there
+  is no state in which an accept can match, so the chain degrades to
+  kill-switch-only rather than failing open.
+- **Rule 3 is scoped on purpose.** A bare `ct state established,related
+  accept` would also match a flow established *through* the tunnel that is now
+  routing out `eth0` because the tunnel dropped — and `accept` is terminal, so
+  it would never reach rules 5 and 6. That is precisely the leak this exists
+  to stop. Scoping cannot break connectivity: the Qubes base forward chain
+  carries its own unscoped established/related accept *after* the jump, so a
+  legitimate packet this rule misses still gets through, while a leaked one
+  hits a drop first.
+- **Rule 7 exists because 5 and 6 name `eth0`.** Traffic leaving by any other
+  interface would fall through to the base forward chain, which is `policy
+  accept`. A second uplink — an attached NIC, a USB tether — would otherwise
+  leak everything, silently.
+- **Each family loads as one `nft -f` transaction.** Adding rules one at a
+  time leaves the chain empty between the flush and the final add, and with a
+  `policy accept` base chain that window is a real leak on *every* firewall
+  reload. A transaction also means a rejected rule leaves the previous ruleset
+  intact instead of a half-built one.
+
+If the ruleset fails to load, the script flushes the chain and forces a bare
+`oifname eth0 drop`. An empty chain would mean `policy accept`, so the failure
+mode is closed, not open.
+
 ## Verify after build
 
 ```sh
@@ -308,10 +395,38 @@ Checked against a running qube (`qubes-core-agent-4.3.47`, Fedora 43) — see
   `custom-forward` first — which is why rule order in that chain, and
   applying it as one atomic `nft -f` transaction, are both security-relevant
 
-**`vpn-rpm-audit`, against the hostile package** (rpm 6.0.2, Fedora 43,
-2026-09-07). `rpmbuild` built `selftest-hostile.spec` and exited 0, its only
-objection a single `warning: absolute symlink` — then the audit raised 14
-FAIL lines and exited 1, catching every planted trait:
+### Why there is a hostile package at all
+
+`tools/rpm/selftest-hostile.spec` is a deliberately malicious package that
+exists to be rejected. Three reasons it is in the repo rather than something
+run once and thrown away:
+
+**An audit script that passes everything looks exactly like one that works.**
+Feeding a checker good input tells you nothing — it returns PASS whether it is
+sound or whether it is a stub. The only way to learn that a refusal actually
+fires is to hand it something you *know* is bad and watch it refuse. Every
+green run of `build-rpm.sh` is evidence only if the red run has been seen too.
+
+**Nothing else in the toolchain will stop you.** `rpmbuild` builds a package
+carrying a root cron job, a setuid binary, a symlink to `/etc/shadow`, an
+`Obsoletes:` on `qubes-core-dom0` and a scriptlet that runs as root in dom0 —
+and exits **0**. Its sole objection is one `warning: absolute symlink` line,
+easily lost in build output. rpm is a packaging tool, not a security boundary,
+and it does not pretend otherwise. If the check does not happen here, it does
+not happen.
+
+**It is what makes the signature mean something.** Signing proves origin, not
+safety — a signed backdoor installs perfectly. The signature is only worth
+trusting because the build qube refuses to sign anything that fails the audit,
+so the audit's soundness is the load-bearing part. Testing it is testing the
+one thing the whole dom0 install path rests on.
+
+The fixture's header documents which check should catch which trait. If one of
+them ever *passes*, that check is broken.
+
+**Result — `vpn-rpm-audit` against the hostile package** (rpm 6.0.2, Fedora
+43, 2026-09-07). `rpmbuild` built it and exited 0; the audit raised 14 FAIL
+lines and exited 1, catching every planted trait:
 
 - the `%post` scriptlet, the `Obsoletes: qubes-core-dom0`, the `Conflicts:`
 - the setuid file, the world-writable file, the non-root owner
