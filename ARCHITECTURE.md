@@ -194,9 +194,18 @@ Two qubes are created per selection:
   private volume is discarded), so it keeps its network config every time it
   restarts.
 
-  The uplink is `sys-firewall`, not `sys-net`, so the `qvm-firewall` rules in
-  §4 are actually enforced. It is also tagged `vpn-endpoint`, so the policy
-  denying file copies out of tagged qubes covers it.
+  Whatever the uplink is, it must be a qube that runs the Qubes firewall
+  service, because `qvm-firewall` rules are enforced by a qube's **netvm** and
+  not by the qube itself. `sys-firewall` qualifies, and so does another VPN
+  qube's disposable (an AppVM with `provides_network true`). Pointing the
+  uplink straight at `sys-net` would leave the Layer 2 rules in §4
+  unenforced, which is why the example above names `sys-firewall`. With
+  `uplink=none` there is no netvm at all, so those rules are configured but
+  inert until the qube is attached. Layer 1, inside the qube, is unaffected
+  either way.
+
+  The disposable is also tagged `vpn-endpoint`, so the policy denying file
+  copies out of tagged qubes covers it.
 
   The uplink is a setting, not a constant: `uplink=` in the selection file
   reaches `dispvm.sls` through the pillar. It may name `sys-firewall`,

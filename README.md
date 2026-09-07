@@ -54,7 +54,7 @@ understanding before anything else.
 | **dom0** | the build commands and the salt states | none, as always |
 | **`salt-configs-vm`** | the settings file you edit, and an authoring copy of the salt states | normal |
 | **`vpn-config-files-vm`** | your provider's configs, **including private keys** | **`netvm = none`** |
-| *(generated)* `<provider>-<sel>-vpn-dvm` + `-vpn` | the template and the disposable you actually use | via `sys-firewall` |
+| *(generated)* `<provider>-<sel>-vpn-dvm` + `-vpn` | the template and the disposable you actually use | template: none; disposable: whatever you set `uplink=` to |
 
 Three consequences, each of which explains a chunk of the rest of this
 document:
@@ -237,9 +237,9 @@ You type one command in dom0: `vpn-build`. In order:
 4. **Fetch the list of VPN server addresses** for the chosen country from
    `vpn-config-files-vm`, validating every line looks like a real IP/port
    before using it.
-5. **Lock down the firewall — before anything else happens.** The VPN qube
-   is restricted to only ever reach the whitelisted server addresses, on the
-   right port and protocol. This happens *before* the config file is
+5. **Lock down the firewall (Layer 2) — before anything else happens.** The
+   VPN qube is restricted to only ever reach the whitelisted server addresses,
+   on the right port and protocol. This happens *before* the config file is
    delivered, so there's never a moment where the qube is open.
 6. **Deliver the actual VPN config.** Only now does dom0 tell
    `vpn-config-files-vm` to send the real config — including its private key
@@ -446,13 +446,16 @@ rather than suggesting an MTU the validator would reject.
 There are two, they run in different places, and neither is sufficient alone.
 Confusing them is the easiest way to think you are protected when you are not.
 
-| | `qvm-firewall` | nftables `custom-forward` |
+Numbering matches [`ARCHITECTURE.md`](ARCHITECTURE.md) §4: **Layer 1 is
+inside the qube, Layer 2 is outside it.**
+
+| | Layer 1 — nftables `custom-forward` | Layer 2 — `qvm-firewall` |
 |---|---|---|
-| Set by | `vpn-firewall-apply`, in dom0 | `qubes-firewall-user-script`, in the qube |
-| Enforced by | `sys-firewall` (the disposable's netvm) | the VPN qube itself |
-| Governs | traffic the VPN qube **originates** | traffic that **passes through** the qube |
-| Stops | the qube talking to anything but the VPN server | downstream qubes leaking to the clear |
-| If the tunnel drops | unaffected — it never saw tunnel traffic | **this is the kill switch** |
+| Set by | `qubes-firewall-user-script`, in the qube | `vpn-firewall-apply`, in dom0 |
+| Enforced by | the VPN qube itself | the disposable's netvm — whatever `uplink=` names |
+| Governs | traffic that **passes through** the qube | traffic the VPN qube **originates** |
+| Stops | downstream qubes leaking to the clear | the qube talking to anything but the VPN server |
+| If the tunnel drops | **this is the kill switch** | unaffected — it never saw tunnel traffic |
 
 The split matters because each is blind to the other's job. `qvm-firewall`
 sees the VPN qube as a single endpoint and cannot distinguish a downstream
@@ -460,30 +463,7 @@ qube's packet from the qube's own. `custom-forward` only sees the forward
 hook, so the tunnel handshake — which the qube originates — never passes
 through it at all.
 
-### Layer 1 — `qvm-firewall`, on the *named disposable*
-
-Applied by `vpn-firewall-apply` to the running disposable, never the template
-(a template with `netvm = none` filters nothing). Final order:
-
-```
-0  drop specialtarget=dns
-1  drop proto=icmp
-2  accept proto=<udp|tcp> dst4=<endpoint-ip> dstports=<port>   (one per endpoint)
-…
-N  drop                                                         (no address family)
-```
-
-The qube may reach the VPN server and nothing else. Three consequences worth
-knowing:
-
-- **DNS is dropped deliberately**, so the qube cannot resolve hostnames. That
-  is why `vpn-up` rewrites an OpenVPN `remote` to the whitelisted IP rather
-  than leaving a hostname in the config.
-- **The trailing `drop` carries no address family**, so it covers IPv6 too.
-- `vpn-firewall-apply` **asserts** the last rule is a drop rather than just
-  printing the list, and exits non-zero if it is not.
-
-### Layer 2 — nftables `custom-forward`, inside the qube
+### Layer 1 — nftables `custom-forward`, inside the qube
 
 Loaded at firewall-service start, before per-qube rules are inserted, so the
 chains are guaranteed to exist. Both `ip` and `ip6` get the identical ruleset
@@ -528,16 +508,58 @@ If the ruleset fails to load, the script flushes the chain and forces a bare
 `oifname eth0 drop`. An empty chain would mean `policy accept`, so the failure
 mode is closed, not open.
 
+### Layer 2 — `qvm-firewall`, on the *named disposable*
+
+Applied by `vpn-firewall-apply` to the running disposable, never the template
+(a template with `netvm = none` filters nothing). Final order:
+
+```
+0  drop specialtarget=dns
+1  drop proto=icmp
+2  accept proto=<udp|tcp> dst4=<endpoint-ip> dstports=<port>   (one per endpoint)
+…
+N  drop                                                         (no address family)
+```
+
+The qube may reach the VPN server and nothing else.
+
+**Enforcement happens in the qube's netvm, not in the qube.** So whatever
+`uplink=` names has to be a qube that runs the Qubes firewall service.
+`sys-firewall` does; a chained VPN qube does, since it is an AppVM with
+`provides_network true`; `sys-net` generally does not, which is why the uplink
+should not point straight at it. With `uplink=none` there is no netvm at all,
+so these rules are configured but inert until the qube is attached.
+
+Three further consequences worth knowing:
+
+- **DNS is dropped deliberately**, so the qube cannot resolve hostnames. That
+  is why `vpn-up` rewrites an OpenVPN `remote` to the whitelisted IP rather
+  than leaving a hostname in the config.
+- **The trailing `drop` carries no address family**, so it covers IPv6 too.
+- `vpn-firewall-apply` **asserts** the last rule is a drop rather than just
+  printing the list, and exits non-zero if it is not.
+
 ## Verify after build
 
 ```sh
-qvm-prefs <dvm-template> netvm            # should be blank (none)
-qvm-prefs <disposable> netvm              # sys-firewall
+qvm-prefs <dvm-template> netvm            # blank (none) — always
+qvm-prefs <disposable> netvm              # whatever you set uplink= to
 qvm-prefs <disposable> provides_network   # True
 qvm-tags  <dvm-template> list             # vpn-endpoint
 qvm-tags  <disposable> list               # vpn-endpoint
 qvm-firewall <disposable> list            # last rule is an unconditional drop
 ```
+
+The disposable's `netvm` should match your `uplink=` value exactly — normally
+`sys-firewall`, another VPN qube's disposable if you are chaining, or blank if
+you set `uplink=none` and intend to attach it by hand later. If it is blank
+and you did *not* ask for `none`, the pillar did not reach `dispvm.sls`; check
+the `'*-vpn-dvm'` glob in `srv/user_pillar/top.sls`.
+
+Note that `uplink=none` means the Layer 2 (`qvm-firewall`) rules are in place
+but **not yet enforced by anything** — those rules are applied by a qube's
+netvm, and this qube has none. They take effect when you attach it. Layer 1,
+inside the qube, is unaffected and works regardless.
 
 In the disposable:
 
