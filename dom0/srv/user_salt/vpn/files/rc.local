@@ -1,0 +1,4 @@
+#!/bin/sh
+# /rw/config/rc.local          (mode 0755)
+/rw/config/vpn-up || logger -t vpn-up "vpn-up failed - qube stays killswitched"
+exit 0

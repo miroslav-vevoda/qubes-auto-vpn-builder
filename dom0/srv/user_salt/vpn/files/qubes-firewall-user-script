@@ -1,0 +1,137 @@
+#!/bin/sh
+#
+# Deploy to:  /rw/config/qubes-firewall-user-script     (mode 0755)
+# NOT /rw/config/qubes/... -- that directory does not exist.
+#
+# Runs inside the VPN qube when its firewall service starts: after the empty
+# Qubes chains are created, but before per-qube rules are inserted. So the
+# custom-forward chains are guaranteed to exist here.
+#
+# Only governs traffic PASSING THROUGH this qube (the nftables forward hook).
+# Traffic the VPN qube originates itself -- including the tunnel handshake to
+# the VPN server -- takes a different path and is not affected by rule 6.
+
+UPLINK="eth0"
+
+# ---------------------------------------------------------------------------
+# Pick the tunnel interface name.
+#
+# The name is decided at build time and written to /rw/config/vpn-params by
+# salt, so it is read from there rather than guessed. A live interface still
+# wins over the configured name, because on a re-run it is ground truth.
+#
+# nft oifname/iifname are per-packet STRING matches, so naming an interface
+# that does not exist yet is fine -- detection only chooses the name, it is
+# not a precondition for the rules to load. (Verified: "oifname nosuchif0"
+# loads; "oif nosuchif0" fails with "Interface does not exist". Do not use
+# oif/iif here.)
+# ---------------------------------------------------------------------------
+CONFIGURED_IF=""
+if [ -r /rw/config/vpn-params ]; then
+    . /rw/config/vpn-params
+    CONFIGURED_IF="${VPN_IF:-}"
+fi
+
+VPN_IF=""
+for cand in $CONFIGURED_IF wireguard vpn0 tun0; do
+    [ -n "$cand" ] || continue
+    if [ -e "/sys/class/net/$cand" ]; then VPN_IF="$cand"; break; fi
+done
+
+# Nothing live yet -- normal at firewall start, the tunnel comes up later.
+# Fall back to the configured name: the rules load now and become effective
+# the moment the interface appears.
+[ -n "$VPN_IF" ] || VPN_IF="$CONFIGURED_IF"
+
+[ -n "$VPN_IF" ] \
+    && logger -t qubes-fw-user "vpn interface: $VPN_IF" \
+    || logger -t qubes-fw-user "no vpn interface configured or live - kill-switch only"
+
+# ---------------------------------------------------------------------------
+# Rules. Both address families, unconditionally.
+#
+# The ip6 chain exists even when IPv6 is disabled, so these always load. With
+# IPv6 off they match nothing and are never evaluated. If IPv6 is ever enabled
+# -- by you or by a template change -- the kill switch already covers it.
+#
+# Each family is applied as ONE "nft -f" transaction. That is not cosmetic:
+# adding rules one at a time leaves custom-forward empty between the flush and
+# the final add, and the Qubes base forward chain is "policy accept", so that
+# window is a real leak on every firewall reload. A transaction also means a
+# rejected rule leaves the previous ruleset intact instead of a half-built one.
+# ---------------------------------------------------------------------------
+RULES=$(mktemp /tmp/qubes-fw-user.XXXXXX) || exit 1
+trap 'rm -f "$RULES"' EXIT INT TERM
+
+rc=0
+for fam in ip ip6; do
+
+    {
+        echo "flush chain $fam qubes custom-forward"
+
+        # 1. Clamp TCP MSS to path MTU (tunnel overhead shrinks usable payload).
+        echo "add rule $fam qubes custom-forward tcp flags syn / syn,rst tcp option maxseg size set rt mtu"
+
+        # 2/3/4. Every accept names the tunnel interface, so when the tunnel is
+        #        down there is no state in which an accept can match. With no
+        #        interface at all the chain is kill-switch only.
+        if [ -n "$VPN_IF" ]; then
+
+            # 2. Downstream qubes -> tunnel. (iifgroup 2 = arrived from a qube
+            #    that uses this one as its netvm.)
+            echo "add rule $fam qubes custom-forward iifgroup 2 oifname \"$VPN_IF\" accept"
+
+            # 3. Return traffic, tunnel -> downstream qubes.
+            #
+            #    Keep this scoped to the tunnel interface. An unscoped
+            #    "ct state established,related accept" would also match a flow
+            #    established THROUGH the tunnel that is now being routed out the
+            #    uplink because the tunnel dropped. accept is a terminal verdict,
+            #    so that packet would be forwarded in the clear without ever
+            #    reaching rules 5 and 6 -- exactly the leak this exists to stop.
+            #
+            #    Scoping it cannot break connectivity: the Qubes base forward
+            #    chain carries its own unconditional established/related accept
+            #    AFTER the jump into custom-forward, so a legitimate return
+            #    packet this rule misses falls through to that one. A leaked
+            #    packet does not get that far -- it matches a drop below.
+            echo "add rule $fam qubes custom-forward iifname \"$VPN_IF\" oifgroup 2 ct state established,related accept"
+
+            # 4. Tunnel -> outside. Already encrypted, safe to let past.
+            echo "add rule $fam qubes custom-forward iifname \"$VPN_IF\" oifname \"$UPLINK\" accept"
+        fi
+
+        # 5. Block downstream qubes -> uplink. This is the leak.
+        echo "add rule $fam qubes custom-forward iifgroup 2 oifname \"$UPLINK\" drop"
+
+        # 6. Kill switch: block anything else -> uplink.
+        echo "add rule $fam qubes custom-forward oifname \"$UPLINK\" drop"
+
+        # 7. Catch-all. Rules 5 and 6 name $UPLINK, so they only cover traffic
+        #    leaving by that one interface. Anything leaving by any OTHER
+        #    interface would fall out of this chain into the Qubes base forward
+        #    chain -- which is "policy accept" and carries its own unscoped
+        #    "ct state established,related accept". Established flows would be
+        #    accepted there and new ones would reach the accept policy, so a
+        #    second uplink (an attached NIC, a USB tether) would leak
+        #    everything, silently.
+        #
+        #    Nothing legitimate reaches here. Downstream-to-downstream is
+        #    already dropped by the base chain's "oifgroup 2 drop"; real return
+        #    traffic matched rule 3; real tunnel traffic matched 2 or 4.
+        echo "add rule $fam qubes custom-forward drop"
+    } > "$RULES"
+
+    if ! nft -f "$RULES"; then
+        # Never leave the chain in whatever state a failure produced. On a
+        # first boot the previous contents are empty, and empty means the base
+        # chain's "policy accept" applies -- so force a bare kill switch.
+        logger -t qubes-fw-user "$fam ruleset FAILED to load - forcing kill switch"
+        nft flush chain "$fam" qubes custom-forward 2>/dev/null
+        nft add rule "$fam" qubes custom-forward oifname "$UPLINK" drop 2>/dev/null \
+            || logger -t qubes-fw-user "$fam EMERGENCY DROP ALSO FAILED - assume leaking"
+        rc=1
+    fi
+done
+
+exit "$rc"

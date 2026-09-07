@@ -1,0 +1,377 @@
+# Qubes VPN Build
+
+Automatically generate a firewalled, disposable VPN qube in Qubes OS from a
+single config choice — protocol, MTU, and a country or specific server — with
+your VPN provider's key material kept in a qube the automation itself never
+has to touch.
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design rationale, the bugs
+in the original concept it fixes, and external validation against Qubes docs
+and community projects.
+
+---
+
+## What this is for
+
+Normally, setting up a VPN qube in Qubes OS is a manual, one-off job: create
+an AppVM, install WireGuard or OpenVPN, copy in one config file by hand,
+write firewall rules by hand, and repeat all of that from scratch every time
+you want to switch provider, country, or server.
+
+This project turns that into one edit and one command. You pick a protocol,
+an MTU, and a country or specific server; you run one build command in dom0;
+you get back a ready-to-use, disposable VPN qube — firewalled, named, and
+connected — with no manual qube-building involved. Want a different server
+next week? Change one line and re-run the build.
+
+That's the whole point: making a correctly-configured VPN qube something you
+generate on demand instead of something you hand-build and are then
+reluctant to touch again.
+
+## Using it
+
+1. Organize your VPN provider's config files one folder per country code, run
+   `tools/build-endpoint-map.sh` over them in the qube you downloaded them in,
+   then copy the whole tree into `vpn-config-files-vm`.
+2. Edit one settings file in `salt-configs-vm`: pick WireGuard or OpenVPN, a
+   transport (`udp`/`tcp`), an MTU, and a country or specific server.
+3. In dom0, run the install/build commands (see **Install order**, below).
+4. Start the resulting disposable qube, and point your other qubes at it as
+   their network source.
+
+Everything else — naming, firewall rules, config delivery, kill switch — is
+automatic from there.
+
+## What happens when you run the build
+
+You type one command in dom0: `vpn-build`. In order:
+
+1. **Read your choice, check it's sane.** dom0 reads the settings file
+   (protocol, MTU, which server) and checks every value against a strict
+   pattern before using it — e.g. the country code must be exactly two
+   lowercase letters. Anything that doesn't match aborts the build rather
+   than guessing.
+2. **Create the qubes.** dom0 derives qube names from your choice (e.g.
+   `uk123` → `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`), then creates a
+   plain AppVM template with no network connection of its own, and a named
+   disposable based on it that does get a connection — the one you actually
+   use.
+3. **Install the scripts into the template**, so every disposable spun up
+   from it inherits them.
+4. **Fetch the list of VPN server addresses** for the chosen country from
+   `vpn-config-files-vm`, validating every line looks like a real IP/port
+   before using it.
+5. **Lock down the firewall — before anything else happens.** The VPN qube
+   is restricted to only ever reach the whitelisted server addresses, on the
+   right port and protocol. This happens *before* the config file is
+   delivered, so there's never a moment where the qube is open.
+6. **Deliver the actual VPN config.** Only now does dom0 tell
+   `vpn-config-files-vm` to send the real config — including its private key
+   — directly to the VPN qube. dom0 never sees its contents.
+7. **Secure what was delivered.** The files are moved out of the inbox into
+   root-owned `0700` storage at `0600` each, and the template is shut back
+   down.
+
+## What happens every time the VPN qube boots
+
+Because it's a disposable, this runs fresh every time:
+
+1. Picks a config — the specific server you chose, or a random one from the
+   country you chose.
+2. Brings up the tunnel (WireGuard or OpenVPN).
+3. Applies the firewall / kill-switch rules (see Architecture).
+4. Sets the correct MTU on downstream qubes so packets fit inside the
+   tunnel's overhead.
+
+## Repository layout
+
+```
+dom0/                                    installed on dom0
+  srv/user_salt/vpn/                     salt states — qube creation, prefs, tags
+    init.sls / dvmtemplate.sls / dispvm.sls / vmfiles.sls
+    files/                               payload placed inside the VPN qube
+      qubes-firewall-user-script         the kill switch
+      90-vif-mtu                         MTU hook for downstream vifs
+      vpn-up                             tunnel bring-up, run at boot
+      rc.local                           calls vpn-up
+      vpn-params.jinja                   -> /rw/config/vpn-params
+  srv/user_pillar/                       generated + example pillar data
+  usr/local/bin/
+    vpn-build                            builds one qube, start to finish
+    vpn-build-all                        several qubes from numbered configs
+    vpn-params-fetch                     validates vpn-selection.conf -> pillar
+    vpn-endpoints-fetch                  validates the endpoint map -> IP:PORT
+    vpn-firewall-apply                   the qvm-firewall ruleset
+    vpn-salt-sync                        authoring only — not used to install
+  etc/qubes/policy.d/30-vpn.policy       the isolation between the two storage qubes
+
+salt-configs-vm/
+  home/user/vpn-selection.conf           the one file you edit
+  home/user/vpn-configs/                 numbered set, for vpn-build-all
+  home/user/salt/                        authoring copy of dom0/srv/user_salt/vpn
+
+vpn-config-files-vm/                     netvm = none
+  etc/qubes-rpc/custom.VpnEndpointList   returns endpoint-map.txt only
+  etc/qubes-rpc/custom.VpnConfigPush     pushes configs to a tagged target qube
+  home/user/configs/<iso>/               one folder per country code
+
+tools/                                   run outside dom0, nothing installed
+  build-endpoint-map.sh                  builds endpoint-map.txt from configs
+  rpm/                                   packaging for the dom0 half
+    manifest.txt                         THE reviewed list of what reaches dom0
+    build-rpm.sh                         manifest -> spec -> signed .rpm
+    vpn-rpm-audit                        refuses a package that fails any check
+    selftest-hostile.spec                a bad package, to prove the audit works
+
+docs/                                    documentation only, nothing installed
+  getting-files-into-dom0.md             building, signing and installing the package
+  original-concept.md                    the first draft, kept for reference
+```
+
+Each top-level directory except `tools/` and `docs/` is named after the qube
+the files under it belong to; the rest of the path is the literal destination
+path inside that qube. `docs/` is prose only. `tools/build-endpoint-map.sh`
+runs wherever you gather your configs — a qube with a network connection,
+which none of the three above has. `tools/rpm/` runs in the build qube, and
+`vpn-rpm-audit` refuses to run in dom0 at all.
+
+## Install order
+
+1. **In `salt-configs-vm`:**
+   ```sh
+   mkdir -p ~/salt
+   cp -a vpn-build/dom0/srv/user_salt/vpn ~/salt/
+   cp vpn-build/salt-configs-vm/home/user/vpn-selection.conf ~/
+   $EDITOR ~/vpn-selection.conf
+   ```
+   For several qubes at once, copy `vpn-configs/` here as well and edit that
+   instead — see **Building several qubes**, below.
+2. **In the networked qube where you downloaded your configs:** arrange them
+   one folder per country code and run `tools/build-endpoint-map.sh ~/configs`.
+   This resolves any hostnames and writes `endpoint-map.txt` into each folder.
+   It has to happen here — it's the only step in the whole workflow with DNS.
+3. **In `vpn-config-files-vm`:** copy `etc/qubes-rpc/*` to `/etc/qubes-rpc/`
+   (mode 755, root:root); copy the whole `configs/` tree from step 2 into
+   `/home/user/configs/`; from dom0,
+   `qvm-prefs vpn-config-files-vm netvm none`. **OpenVPN only:** if your
+   configs carry a bare `auth-user-pass` line, put your service username and
+   password on two lines in `/home/user/configs/auth-user-pass.txt` — without
+   it the tunnel cannot authenticate. See `configs/README.txt`.
+4. **Install the dom0 half as a signed package.** In a dedicated offline build
+   qube: `tools/rpm/build-rpm.sh --sign <KEYID>`, which generates the spec
+   from `tools/rpm/manifest.txt`, builds, signs, and then runs
+   `tools/rpm/vpn-rpm-audit` against its own output — deleting the package if
+   any check fails. Then, in dom0, pull the one `.rpm`, `rpmkeys -Kv` it, and
+   `sudo rpm -Uvh`.
+
+   Full procedure, including generating the key and getting its fingerprint
+   into dom0 safely, is in
+   [`docs/getting-files-into-dom0.md`](docs/getting-files-into-dom0.md).
+
+   This is the only time code crosses into dom0. Note what the signature does
+   and does not do: it proves the package left the build VM unmodified. It
+   does **not** make the contents safe — a signed backdoor installs perfectly
+   — so `vpn-rpm-audit` checks the package (no install-time scriptlets, no
+   symlinks or setuid, nothing outside the manifest, every digest matching the
+   reviewed source), and reading the source is still on you. What signing buys
+   is that all of that checking happens in a disposable qube instead of in
+   dom0.
+5. **In dom0:** `vpn-build` — creates everything. For a set of numbered
+   configs instead, `vpn-build-all -n` to validate and then `vpn-build-all`
+   to build (see **Building several qubes**).
+6. **Use it:**
+   ```sh
+   qvm-start <provider>-<sel>-vpn
+   qvm-prefs <some-qube> netvm <provider>-<sel>-vpn
+   ```
+
+## Building several qubes
+
+`vpn-build` builds one qube from one settings file. `vpn-build-all` builds a
+set, in order, from a directory of numbered settings files in
+`salt-configs-vm`:
+
+```
+~/vpn-configs/
+  10-uk123.conf     uplink=sys-firewall          entry hop
+  20-de77.conf      uplink=nordvpn-uk123-vpn     chained inside it
+  30-nl04.conf      uplink=none                  attach by hand later
+```
+
+Each file has exactly the format of `vpn-selection.conf`. Which leaves three
+ways to build, all run in dom0:
+
+```sh
+vpn-build                            # ~/vpn-selection.conf   -> one qube
+vpn-build-all -n                     # validate the set, create nothing
+vpn-build-all                        # ~/vpn-configs/*.conf   -> the whole set
+vpn-build vpn-configs/20-de77.conf   # one file out of the set -> one qube
+```
+
+The last is for rebuilding a single hop after editing it, without touching
+the rest. `uplink` is read from that file as usual, so a chained qube stays
+chained — but seeing one file, `vpn-build` cannot check the MTU against its
+parent or spot a name collision with another config. Run `vpn-build-all -n`
+first if more than that one file changed.
+
+Nothing about the single-file path changed. `vpn-build` with no argument
+behaves exactly as it always did, and if you never create `~/vpn-configs/`
+none of this applies to you.
+
+**Always sequential.** A chained qube's uplink has to exist before it does,
+and `/srv/user_pillar/vpn.sls` is a single file that every build overwrites —
+so two builds at once would race even with no chaining involved.
+
+**Numbering and `uplink` are separate axes.** The filename decides *when* a
+config is built; the `uplink` field decides *where* it attaches. Two
+independent VPN qubes both on `sys-firewall` are a normal set.
+
+**`uplink` defaults to `none`, never to `sys-firewall`.** An omitted key must
+never hand a qube a network path nobody asked for. `none` is also a
+legitimate deliberate value — the qube is fully built, firewalled and loaded
+with its config, and you attach it later with `qvm-prefs <disposable> netvm
+<qube>`. The final report lists every qube built this way.
+
+**Nothing is created until the whole set validates.** `vpn-params-fetch`
+already checks each file on its own; `vpn-build-all` adds the checks no
+single file can be validated against:
+
+- **name collisions** — two configs deriving the same qube names would
+  silently produce one qube, the second config's key material overwriting the
+  first's;
+- **uplink ordering** — an uplink must name a lower-numbered config's
+  disposable, an existing qube, or `none`. Requiring *lower-numbered* is also
+  what makes a routing loop impossible to write, so there is no cycle to
+  detect;
+- **MTU descent** — each hop must fit inside its parent (~60 bytes per
+  WireGuard hop, ~69 OpenVPN/udp, ~89 OpenVPN/tcp). Every MTU in a broken
+  chain is inside 1280–1500, so each file passes alone; get it wrong and you
+  get a tunnel where ping works and anything large vanishes. `--no-mtu-check`
+  skips this if your provider's real overhead is smaller;
+- **endpoint availability** — asked up front, rather than at step 4/7 after
+  the qubes already exist.
+
+A set failing any of these is refused entirely, because a half-built chain is
+worse than an unbuilt one: qubes holding live key material, a child pointing
+at a parent that does not exist, and no record of which qubes were yours.
+
+**Nothing is started.** The build is a build; the report prints the start
+order, and a chained qube needs its uplink running first.
+
+The 1280 MTU floor puts a practical limit of about three WireGuard hops on a
+1500-byte uplink. Past that, `vpn-build-all` says the chain is too long
+rather than suggesting an MTU the validator would reject.
+
+## Verify after build
+
+```sh
+qvm-prefs <dvm-template> netvm            # should be blank (none)
+qvm-prefs <disposable> netvm              # sys-firewall
+qvm-prefs <disposable> provides_network   # True
+qvm-tags  <dvm-template> list             # vpn-endpoint
+qvm-tags  <disposable> list               # vpn-endpoint
+qvm-firewall <disposable> list            # last rule is an unconditional drop
+```
+
+In the disposable:
+
+```sh
+sudo journalctl -t vpn-up -t qubes-fw-user
+sudo nft list chain ip  qubes custom-forward
+sudo nft list chain ip6 qubes custom-forward   # must not be empty
+ip link show wireguard                          # or vpn0
+sudo stat -c '%a %n' /rw/config/vpn/*.conf      # 600
+```
+
+Every `accept` in `custom-forward` must name the tunnel interface, and the
+chain must end with a bare `drop`. A bare `ct state established,related
+accept` in that chain is a leak: it matches flows established through the
+tunnel that are now routing out `eth0`, and `accept` is terminal, so they
+never reach the drops below. The trailing `drop` covers the mirror-image
+case — traffic leaving by an interface the earlier drops don't name.
+
+**Kill-switch test — the one that actually matters:** with a downstream qube
+online, run `sudo wg-quick down wireguard` in the disposable. Downstream
+traffic must stop dead, not fall back to the clear.
+
+## Status: verified vs. assumed
+
+Checked against a running qube (`qubes-core-agent-4.3.47`, Fedora 43) — see
+`ARCHITECTURE.md` for the detail:
+
+- the firewall script path and its execute-bit/shebang requirement
+- `custom-forward` exists in both `ip qubes` and `ip6 qubes` even with IPv6 off
+- all six kill-switch rules load identically in both address families
+- `oifname` accepts a not-yet-existing interface name; `oif` does not
+
+- the Qubes base forward chain is `policy accept` and jumps to
+  `custom-forward` first — which is why rule order in that chain, and
+  applying it as one atomic `nft -f` transaction, are both security-relevant
+
+**`vpn-rpm-audit`, against the hostile package** (rpm 6.0.2, Fedora 43,
+2026-09-07). `rpmbuild` built `selftest-hostile.spec` and exited 0, its only
+objection a single `warning: absolute symlink` — then the audit raised 14
+FAIL lines and exited 1, catching every planted trait:
+
+- the `%post` scriptlet, the `Obsoletes: qubes-core-dom0`, the `Conflicts:`
+- the setuid file, the world-writable file, the non-root owner
+- the symlink to `/etc/shadow` — twice, once from header metadata (check 6)
+  and again from the unpacked payload (check 9)
+- the `%ghost`, the `/etc/cron.d` path, the compressed payload, and every
+  manifest and source-tree mismatch
+
+Two of the fourteen were not predicted when the fixture was written: rpm
+injects a `/bin/sh` dependency whenever a scriptlet exists — *even under
+`AutoReqProv: no`* — so check 4 catches install-time code independently of
+check 3. Reproduce it with the commands in `selftest-hostile.spec`.
+
+**`build-rpm.sh`, end to end** (same host and date). Three runs: unsigned
+fails only check 2 and the package is deleted, exit 1; signed with a matching
+key passes all 31 assertions and the package is kept, exit 0; signed with a
+non-matching key fails check 2 and is deleted. Short key ids, `0x` prefixes
+and spaced gpg fingerprints all match correctly.
+
+Getting there took fixing two real bugs, both worth knowing about:
+
+- **`brp-mangle-shebangs` rewrote the payload.** Fedora's rpmbuild runs
+  policy scripts over the buildroot after `%install`; one of them rewrites
+  `#!/bin/bash` to `#!/usr/bin/bash` in every file with the execute bit. The
+  package therefore shipped bytes that were *not* the reviewed bytes —
+  harmless in effect, fatal to the guarantee. Check 8 caught it, failing on
+  exactly the ten 0755 files and no others. Fixed by setting
+  `%global __os_install_post %{nil}` in the generated spec.
+- **The `--key` check could never pass on rpm 6.** rpm 4/5 print
+  `key ID <16 hex>`; rpm 6 prints `key fingerprint: <40 hex>`. The audit
+  matched only the older wording, so a correctly signed package was reported
+  as signed by "a different key: " — with nothing after the colon. A false
+  failure in a security tool is worse than no check, because the sane
+  response is to stop believing it. Now accepts either wording, and fails
+  loudly if it can parse no key id at all rather than passing silently.
+
+Neither would have been found by reading the scripts.
+
+**Not checked** — dom0 was not accessible from the authoring qube:
+
+- exact `qvm.present` / `qvm.prefs` / `qvm.tags` / `qvm.service` salt state
+  argument forms against your Qubes salt version
+- the `qrexec-client -d <vm> 'DEFAULT:QUBESRPC <service> dom0'` call form and
+  the `user=user` policy qualifier
+- `base_template` in the generated pillar defaults to `fedora-42-xfce` —
+  change it to yours, and confirm it has `qubes-mgmt-salt-vm-connector`,
+  `wireguard-tools`, and/or `openvpn` installed
+- the `'*-vpn-dvm'` pillar glob in `srv/user_pillar/top.sls` — confirm your
+  dvm template actually receives the pillar, or `vpn-params` will render
+  empty
+- **OpenVPN mode end to end.** The WireGuard path is the one the design was
+  built around; the OpenVPN path (remote rewrite from the endpoint map,
+  `dev` pinning, `tcp` transport) is reasoned-through but has not been run.
+- **Installing the package in dom0.** The build and audit are proven (see
+  *Verified* above), but no package has been transferred to dom0 or installed
+  there. `rpm -Uvh`, the `.rpmnew` behaviour on upgrade, and `rpm -V` drift
+  reporting are all reasoned-through and unexercised.
+- **Chained VPN qubes end to end.** `vpn-build-all`'s own logic is tested
+  (validation, ordering, MTU descent, failure handling — against stubbed
+  `qvm-*` commands), but no chain has actually been brought up. Two things
+  to watch when you first try it: whether your provider allows reaching one
+  of its endpoints from inside another of its tunnels, and whether the real
+  per-hop overhead matches the conservative figures above.

@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# /etc/qubes-rpc/custom.VpnEndpointList     (in vpn-config-files-vm, mode 0755)
+#
+# stdin : one line, a two-letter ISO country code
+# stdout: that country's endpoint-map.txt, verbatim
+#
+# Metadata only. This service can never emit a config body or key material --
+# it only ever cats endpoint-map.txt. Called by dom0; see 30-vpn.policy.
+#
+# The map is built OUTSIDE this qube, by tools/build-endpoint-map.sh, in the
+# networked qube where the configs were downloaded. That is the only place a
+# hostname can be resolved to an address: this qube has netvm = none, dom0 has
+# no network, and the VPN qube has DNS dropped by the firewall.
+
+set -eu
+
+read -r country || exit 1
+case "$country" in
+    [a-z][a-z]) ;;
+    *) echo "invalid country code" >&2; exit 1 ;;
+esac
+
+f="/home/user/configs/$country/endpoint-map.txt"
+[ -f "$f" ] || { echo "no endpoint map for $country" >&2; exit 1; }
+
+exec cat "$f"

@@ -1,0 +1,26 @@
+# Build output. build-rpm.sh defaults to ~/rpmbuild-vpn (outside the repo),
+# but --outdir can put it anywhere.
+/rpmbuild-vpn/
+*.rpm
+build.log
+*.spec.generated
+
+# Self-test scratch
+/selftest/
+
+# Real provider configuration must never be committed. On a live system the
+# directory below holds .ovpn/.conf files and WireGuard keys; in this repo it
+# holds only documentation and the endpoint map. These patterns make an
+# accidental "git add -A" after copying real configs in a no-op rather than a
+# key disclosure.
+vpn-config-files-vm/home/user/configs/**/*.conf
+vpn-config-files-vm/home/user/configs/**/*.ovpn
+vpn-config-files-vm/home/user/configs/**/*.key
+vpn-config-files-vm/home/user/configs/**/*.pem
+vpn-config-files-vm/home/user/configs/**/*.crt
+vpn-config-files-vm/home/user/configs/**/auth-user-pass.txt
+
+# Editors and OS cruft
+*~
+*.swp
+.DS_Store

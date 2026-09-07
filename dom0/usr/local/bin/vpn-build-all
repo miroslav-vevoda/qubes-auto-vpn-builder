@@ -1,0 +1,322 @@
+#!/bin/bash
+#
+# /usr/local/bin/vpn-build-all          (dom0)
+#
+# usage: vpn-build-all [-n] [--no-mtu-check] [<dir-under-/home/user>]
+#                                                   default: vpn-configs
+#
+# Build several VPN qubes from a directory of numbered selection files in
+# salt-configs-vm, in filename order:
+#
+#     ~/vpn-configs/10-uk123.conf     uplink=sys-firewall
+#     ~/vpn-configs/20-de77.conf      uplink=nordvpn-uk123-vpn    <- chained
+#     ~/vpn-configs/30-nl04.conf      uplink=none                 <- attach later
+#
+# SEQUENTIAL, always. Two reasons, and either alone would be enough:
+#   - a chained qube's uplink must exist before the qube that uses it;
+#   - /srv/user_pillar/vpn.sls is one file that every build overwrites, so two
+#     builds at once would race on it even with no chaining involved.
+#
+# Numbering and uplink are separate axes on purpose. The filename decides WHEN
+# a config is built; the uplink field decides WHERE it attaches. "20 comes
+# after 10" does not mean "20 routes through 10" -- two independent VPN qubes
+# both on sys-firewall are a normal thing to want.
+#
+# NOTHING IS CREATED UNTIL THE WHOLE SET VALIDATES. vpn-params-fetch already
+# checks each file on its own; this adds the checks that no single file can be
+# validated against -- name collisions, uplink ordering, MTU descent along a
+# chain, endpoint availability. A set that fails any of them is refused
+# entirely, because a half-built chain is worse than an unbuilt one: qubes
+# carrying live key material, a child pointing at a parent that does not
+# exist, and no record of which qubes were yours.
+#
+# Nothing is started either. The build is a build; the report at the end tells
+# you the start order.
+
+set -euo pipefail
+
+CONFIG_VM="salt-configs-vm"
+CONFIG_HOME="/home/user"
+
+MAX_BYTES=65536
+TIMEOUT=60
+
+MTU_FLOOR=1280          # must match vpn-params-fetch
+
+die()  { echo "vpn-build-all: $*" >&2; exit 1; }
+head2() { echo; echo "=== $* ==="; }
+
+[ "$(hostname)" = "dom0" ] || die "must be run in dom0 (hostname is '$(hostname)')"
+
+check_only=0
+mtu_check=1
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -n|--check)     check_only=1; shift ;;
+        --no-mtu-check) mtu_check=0; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option $1" ;;
+        *)  break ;;
+    esac
+done
+
+DIR_REL="${1:-vpn-configs}"
+[[ "$DIR_REL" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] \
+    || die "bad directory '$DIR_REL' (letters, digits, . _ - and / only)"
+case "/$DIR_REL/" in */../*) die "directory may not contain '..'" ;; esac
+
+# Tunnel overhead per hop, in bytes. Conservative round figures, not exact:
+# they are here to catch an MTU that is obviously too large for its parent,
+# not to compute an optimal one. WireGuard over IPv4/UDP is 20+8+32. The
+# OpenVPN figures allow for its header, IV and HMAC on top of the outer
+# IP/UDP or IP/TCP headers, and vary with cipher.
+#
+# If your provider's real overhead is smaller and this rejects a set you know
+# is fine, --no-mtu-check skips these comparisons and nothing else.
+overhead_for() {
+    case "$1/$2" in
+        wireguard/*) echo 60 ;;
+        openvpn/udp) echo 69 ;;
+        openvpn/tcp) echo 89 ;;
+        *)           echo 89 ;;   # unknown: assume the worst
+    esac
+}
+
+# --- find the configs --------------------------------------------------------
+
+head2 "reading $CONFIG_VM:$CONFIG_HOME/$DIR_REL"
+
+listing=$(timeout "$TIMEOUT" qvm-run --pass-io --no-gui "$CONFIG_VM" \
+              "ls -1 '$CONFIG_HOME/$DIR_REL'" | head -c "$MAX_BYTES") \
+    || die "cannot list $CONFIG_HOME/$DIR_REL in $CONFIG_VM (or it timed out)"
+
+# The listing is untrusted. Take only names matching the numbering convention
+# and drop everything else silently -- an editor backup or a stray note in
+# that directory should not be a build failure.
+files=()
+while IFS= read -r name; do
+    [[ "$name" =~ ^[0-9]{2,4}-[A-Za-z0-9._-]+\.conf$ ]] || continue
+    files+=("$name")
+done < <(printf '%s\n' "$listing" | sort -t- -k1,1n -k2,2)
+
+[ "${#files[@]}" -gt 0 ] \
+    || die "no files matching NN-name.conf in $CONFIG_HOME/$DIR_REL"
+
+# Two files with the same number have no defined order between them, and the
+# order is the whole point of numbering them.
+declare -A num_seen=()
+for f in "${files[@]}"; do
+    n="${f%%-*}"
+    [ -z "${num_seen[$n]+x}" ] \
+        || die "two configs share the number '$n': ${num_seen[$n]} and $f"
+    num_seen[$n]="$f"
+done
+
+echo "${#files[@]} config(s), in build order:"
+printf '  %s\n' "${files[@]}"
+
+# --- phase 1: validate every config, individually then as a set --------------
+# Read-only throughout. Nothing below this point creates, modifies or starts
+# anything until phase 2.
+
+head2 "validating (nothing is created yet)"
+
+n=${#files[@]}
+c_provider=(); c_protocol=(); c_transport=(); c_mtu=(); c_mode=()
+c_country=();  c_server=();   c_dvm=();       c_disp=(); c_uplink=()
+
+for ((i = 0; i < n; i++)); do
+    f="${files[$i]}"
+    if ! summary=$(/usr/local/bin/vpn-params-fetch -n "$DIR_REL/$f" 2>&1); then
+        echo "$summary" >&2
+        die "$f failed validation (see above); nothing has been created"
+    fi
+
+    # vpn-params-fetch -n emits fixed key=value lines it generated itself from
+    # already-validated values, so this is parsing our own output, not the
+    # config file.
+    declare -A kv=()
+    while IFS='=' read -r k v; do
+        [ -n "$k" ] && kv["$k"]="$v"
+    done <<< "$summary"
+
+    c_provider[$i]="${kv[provider]}"
+    c_protocol[$i]="${kv[protocol]}"
+    c_transport[$i]="${kv[transport]}"
+    c_mtu[$i]="${kv[mtu]}"
+    c_mode[$i]="${kv[mode]}"
+    c_country[$i]="${kv[country]}"
+    c_server[$i]="${kv[server]}"
+    c_dvm[$i]="${kv[dvm_template]}"
+    c_disp[$i]="${kv[dispvm]}"
+    c_uplink[$i]="${kv[uplink]}"
+
+    printf '  ok  %-22s -> %-24s mtu %s  uplink %s\n' \
+        "$f" "${c_disp[$i]}" "${c_mtu[$i]}" "${c_uplink[$i]}"
+done
+
+# 1a. Name collisions. Each file is individually valid; two that derive the
+#     same names are not. Building both would silently produce ONE qube, with
+#     the second config's key material overwriting the first's.
+declare -A name_owner=()
+for ((i = 0; i < n; i++)); do
+    for nm in "${c_dvm[$i]}" "${c_disp[$i]}"; do
+        [ -z "${name_owner[$nm]+x}" ] \
+            || die "${files[$i]} and ${name_owner[$nm]} both derive the qube name '$nm'
+Change the provider or selector in one of them."
+        name_owner[$nm]="${files[$i]}"
+    done
+done
+
+# 1b. Uplink resolution and ordering.
+#
+#     A config's uplink must be one of:
+#       none                     -- deliberate, no ordering constraint at all
+#       a LOWER-numbered config's disposable   -- chained, built before it
+#       a qube that already exists outside the set
+#
+#     Requiring "lower-numbered" rather than just "somewhere in the set" is
+#     what makes cycles impossible: a cycle needs a backward reference, and
+#     there is no way to write one. That is a whole cycle detector replaced by
+#     an index comparison, with nothing given up -- a chain that must be built
+#     in an order gets numbered in that order, which is what the numbers are.
+#
+#     In-set membership is tested BEFORE asking whether the qube exists. A
+#     forward reference to a qube left over from an earlier run would
+#     otherwise pass qvm-check and be built in the wrong order.
+declare -A disp_index=()
+for ((i = 0; i < n; i++)); do disp_index["${c_disp[$i]}"]=$i; done
+
+for ((i = 0; i < n; i++)); do
+    up="${c_uplink[$i]}"
+    [ "$up" = "none" ] && continue
+
+    if [ -n "${disp_index[$up]+x}" ]; then
+        j="${disp_index[$up]}"
+        [ "$j" -lt "$i" ] || die "${files[$i]} takes its uplink from '$up', which is built by ${files[$j]} -- later in the order.
+Renumber so the uplink is built first."
+    elif ! qvm-check --quiet "$up" 2>/dev/null; then
+        die "${files[$i]} names uplink '$up', which is not a qube and is not built by this set.
+Fix the name, add a config for it earlier in the order, or use uplink=none."
+    fi
+done
+
+# 1c. MTU descent. Inherently a property of a PAIR, so it cannot be checked
+#     one file at a time: every MTU in a broken chain is inside 1280-1500 and
+#     each file passes on its own. Getting it wrong gives you a tunnel where
+#     pings work and anything large disappears.
+if [ "$mtu_check" = 1 ]; then
+    for ((i = 0; i < n; i++)); do
+        up="${c_uplink[$i]}"
+        [ "$up" = "none" ] && continue
+        [ -n "${disp_index[$up]+x}" ] || continue   # parent outside the set:
+                                                    # its MTU is not ours to know
+        j="${disp_index[$up]}"
+        ov=$(overhead_for "${c_protocol[$i]}" "${c_transport[$i]}")
+        budget=$(( c_mtu[j] - ov ))
+
+        # Floor first, and the order matters. If the budget has fallen below
+        # the floor there is no MTU that satisfies both this check and
+        # vpn-params-fetch's 1280 minimum -- so telling the user to "lower it
+        # to 1222" would send them to an error they cannot clear. The problem
+        # is the chain, not the number.
+        [ "$budget" -ge "$MTU_FLOOR" ] || die "${files[$i]} cannot fit inside ${files[$j]} (mtu ${c_mtu[$j]}).
+${c_protocol[$i]}/${c_transport[$i]} costs ${ov} bytes, leaving ${budget} -- below the ${MTU_FLOOR} floor,
+so no valid mtu exists for this hop. The chain is one hop too long for these
+protocols: shorten it, raise an earlier hop's mtu, or use a cheaper protocol."
+
+        [ "${c_mtu[$i]}" -le "$budget" ] || die "${files[$i]} sets mtu=${c_mtu[$i]}, but it runs inside ${files[$j]} (mtu ${c_mtu[$j]}).
+${c_protocol[$i]}/${c_transport[$i]} costs ${ov} bytes, so it needs mtu <= ${budget}.
+Lower it, or re-run with --no-mtu-check if your provider's overhead is smaller."
+    done
+fi
+
+# 1d. Endpoint availability. vpn-build does not discover this until step 4/7,
+#     after it has already created the qubes -- fine for one build, wrong in
+#     the middle of a chain. Ask now, while nothing exists yet.
+for ((i = 0; i < n; i++)); do
+    if [ "${c_mode[$i]}" = "random" ]; then
+        eps=$(/usr/local/bin/vpn-endpoints-fetch "${c_country[$i]}" 2>&1) || eps=""
+    else
+        eps=$(/usr/local/bin/vpn-endpoints-fetch "${c_country[$i]}" "${c_server[$i]}" 2>&1) || eps=""
+    fi
+    [ -n "$eps" ] || die "${files[$i]}: no usable endpoints for country '${c_country[$i]}'${c_server[$i]:+ server '${c_server[$i]}'}.
+Check that vpn-config-files-vm has configs and an endpoint-map.txt for it."
+done
+
+# 1e. Not an error: qubes that already exist will be re-applied by salt and
+#     re-sent their configs. Worth saying out loud before it happens.
+existing=()
+for ((i = 0; i < n; i++)); do
+    if qvm-check --quiet "${c_disp[$i]}" 2>/dev/null; then existing+=("${c_disp[$i]}"); fi
+done
+if [ "${#existing[@]}" -gt 0 ]; then
+    echo
+    echo "note: these already exist and will be rebuilt in place:"
+    printf '  %s\n' "${existing[@]}"
+fi
+
+echo
+echo "all ${n} config(s) validated as a set."
+
+if [ "$check_only" = 1 ]; then
+    echo "(-n given: nothing built)"
+    exit 0
+fi
+
+# --- phase 2: build, in order, stopping at the first failure -----------------
+
+head2 "building ${n} qube(s)"
+
+built=()
+for ((i = 0; i < n; i++)); do
+    echo
+    echo "-------- [$((i + 1))/$n] ${files[$i]}  ->  ${c_disp[$i]} --------"
+    if ! /usr/local/bin/vpn-build "$DIR_REL/${files[$i]}"; then
+        echo >&2
+        echo "vpn-build-all: FAILED on ${files[$i]} (${c_disp[$i]})" >&2
+        if [ "${#built[@]}" -gt 0 ]; then
+            echo "already built and left in place:" >&2
+            printf '  %s\n' "${built[@]}" >&2
+        else
+            echo "nothing was built." >&2
+        fi
+        echo "remaining configs were not attempted." >&2
+        exit 1
+    fi
+    built+=("${c_disp[$i]}")
+done
+
+# --- report ------------------------------------------------------------------
+# Start order, not autostart. A chained qube needs its parent running, and a
+# build that quietly left tunnels up would be doing something you did not ask
+# for.
+
+head2 "built ${#built[@]} qube(s)"
+
+echo
+echo "Start in this order (a chained qube needs its uplink running first):"
+for ((i = 0; i < n; i++)); do
+    [ "${c_uplink[$i]}" = "none" ] && continue
+    printf '  qvm-start %s\n' "${c_disp[$i]}"
+done
+
+noup=()
+for ((i = 0; i < n; i++)); do
+    [ "${c_uplink[$i]}" = "none" ] && noup+=("${c_disp[$i]}")
+done
+if [ "${#noup[@]}" -gt 0 ]; then
+    echo
+    echo "Built with no uplink (uplink=none, or the key was absent):"
+    for d in "${noup[@]}"; do
+        printf '  %-24s attach with: qvm-prefs %s netvm <qube>\n' "$d" "$d"
+    done
+    echo "These are fully built -- firewall applied, configs delivered -- but"
+    echo "their tunnels cannot come up until an uplink is attached."
+fi
+
+echo
+echo "Chain layout:"
+for ((i = 0; i < n; i++)); do
+    printf '  %-24s <- %s\n' "${c_disp[$i]}" "${c_uplink[$i]}"
+done

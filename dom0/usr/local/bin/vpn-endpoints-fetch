@@ -1,0 +1,75 @@
+#!/bin/bash
+#
+# /usr/local/bin/vpn-endpoints-fetch          (dom0)
+#
+# Ask vpn-config-files-vm for the endpoint map of one country and emit
+# validated "IP:PORT" lines on stdout.
+#
+# usage: vpn-endpoints-fetch <country> [server-stem]
+#
+# The country is passed on STDIN to a qrexec service, so no shell command is
+# ever constructed from it. Every returned line is re-validated here as well:
+# dom0 does not trust output from an AppVM.
+
+set -euo pipefail
+
+VPNCONF_VM="vpn-config-files-vm"
+SERVICE="custom.VpnEndpointList"
+
+# A qrexec service can return as much as it likes. dom0 must not size a buffer
+# from an AppVM's output, and must not wait on it forever. A country map is a
+# few kilobytes; 1 MiB is far beyond any legitimate one.
+MAX_BYTES=1048576
+TIMEOUT=60
+
+country="${1:?usage: vpn-endpoints-fetch <country> [server-stem]}"
+stem="${2:-}"
+
+[[ "$country" =~ ^[a-z]{2}$ ]] || { echo "bad country" >&2; exit 1; }
+[ -z "$stem" ] || [[ "$stem" =~ ^[a-z]{2}[0-9]{1,4}$ ]] || { echo "bad stem" >&2; exit 1; }
+
+# head -c bounds the read itself rather than checking the size after buffering
+# it, so an oversized reply cannot be absorbed into dom0 memory first. If the
+# service exceeds the cap, head closes the pipe, the producer takes SIGPIPE and
+# pipefail turns the whole thing into the failure below -- which is the right
+# outcome: refuse the input rather than truncate it and act on a partial list.
+raw=$(printf '%s\n' "$country" \
+      | timeout "$TIMEOUT" qrexec-client -d "$VPNCONF_VM" "DEFAULT:QUBESRPC $SERVICE dom0" \
+      | head -c "$MAX_BYTES") \
+      || { echo "endpoint list request failed, timed out, or exceeded ${MAX_BYTES} bytes" >&2; exit 1; }
+
+found=0
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    # The map carries a header written by tools/build-endpoint-map.sh. Skip
+    # comments rather than reporting each one as malformed -- otherwise every
+    # build prints a rejection warning per header line and the warning stops
+    # meaning anything.
+    case "$line" in \#*) continue ;; esac
+    # Expected: uk123.nordvpn.com.conf 1.2.3.4:1194
+    # The TLD is not pinned to .com -- providers use .net and others.
+    if [[ ! "$line" =~ ^([a-z]{2}[0-9]{1,4})\.[a-z0-9-]+\.[a-z]{2,6}\.conf[[:space:]]+([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})$ ]]; then
+        echo "rejected malformed endpoint line" >&2
+        continue
+    fi
+    lstem="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[4]}"
+
+    ok=1
+    IFS='.' read -r a b c d <<< "$ip"
+    for o in "$a" "$b" "$c" "$d"; do
+        # No leading zeros: "010.0.0.1" is ambiguous (octal in some parsers)
+        # and must not be handed to qvm-firewall as if it were unambiguous.
+        [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] || { ok=0; continue; }
+        [ "$o" -le 255 ] || ok=0
+    done
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || ok=0
+    [ "$ok" = 1 ] || { echo "rejected out-of-range or ambiguous endpoint" >&2; continue; }
+
+    # Specific-server mode: emit only the matching endpoint.
+    [ -n "$stem" ] && [ "$lstem" != "$stem" ] && continue
+
+    printf '%s:%s\n' "$ip" "$port"
+    found=$((found+1))
+done <<< "$raw"
+
+[ "$found" -gt 0 ] || { echo "no usable endpoints for $country${stem:+/$stem}" >&2; exit 1; }

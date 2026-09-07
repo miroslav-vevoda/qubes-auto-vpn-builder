@@ -1,0 +1,124 @@
+#!/bin/bash
+#
+# /usr/local/bin/vpn-salt-sync          (dom0)
+#
+# Pull the state tree from salt-configs-vm into dom0.
+#
+# THIS IS NOT PART OF INSTALLATION. The state tree is installed once, by hand,
+# alongside everything else in dom0 -- see docs/getting-files-into-dom0.md.
+# This script is for the authoring loop only: you are EDITING the salt code and
+# want the edited copy in dom0 again.
+#
+# It is not needed to change a setting. Protocol, transport, MTU, country and
+# server all reach the state tree as pillar values, and dom0 writes the pillar
+# itself from vpn-selection.conf. Those nine files are identical on every
+# build, so if you are not changing salt code, you never need to run this.
+#
+# A .sls file in /srv/user_salt is CODE THAT RUNS AS ROOT IN dom0. This is
+# therefore a deliberate, reviewed software install -- never an automatic
+# runtime fetch. It shows you a diff and requires confirmation. Do not wire
+# this into vpn-build or into a timer.
+#
+# The archive is UNTRUSTED. Three things follow from that, and all three are
+# load-bearing:
+#   - only the vpn/ subtree may be synced, so nothing that decides WHAT runs
+#     in dom0 (top.sls above all) can arrive this way;
+#   - the diff you approve must cover everything that gets installed, or the
+#     review is theatre;
+#   - no chmod may ever run against a path the archive controls, because
+#     chmod follows symlinks and would re-mode an arbitrary dom0 file as root.
+
+set -euo pipefail
+
+CONFIG_VM="salt-configs-vm"
+REMOTE_DIR="/home/user/salt"
+DEST="/srv/user_salt"
+SUBTREE="vpn"
+
+QREXEC_TIMEOUT=120
+
+die() { echo "vpn-salt-sync: $*" >&2; exit 1; }
+
+# This writes to /srv/user_salt, which only exists in dom0. Run anywhere else
+# and it would either fail confusingly or create a misleading directory.
+[ "$(hostname)" = "dom0" ] || die "must be run in dom0 (hostname is '$(hostname)')"
+
+STAGE=$(mktemp -d /tmp/vpn-salt-sync.XXXXXX)
+chmod 700 "$STAGE"
+trap 'rm -rf "$STAGE"' EXIT
+
+echo "Fetching $CONFIG_VM:$REMOTE_DIR ..."
+# Ownership, permissions and timestamps from the archive are all discarded, so
+# nothing inside it can arrive setuid or root-owned. (tar also strips leading
+# "/" and refuses ".." members by default; the vetting below is the real check.)
+# timeout: a qube that accepts the connection and then never writes would
+# otherwise hang this indefinitely with no way to tell it apart from a slow
+# transfer.
+timeout "$QREXEC_TIMEOUT" \
+    qvm-run --pass-io --no-gui "$CONFIG_VM" "tar -c -C $REMOTE_DIR ." \
+    | tar -x --no-same-owner --no-same-permissions --no-same-time -C "$STAGE" \
+    || die "fetch or extract failed (or timed out after ${QREXEC_TIMEOUT}s)"
+
+# --- vet the tree BEFORE it is diffed, chmod'd or copied ---------------------
+
+bad=$(find "$STAGE" -mindepth 1 ! -type f ! -type d -printf '%P\n')
+[ -z "$bad" ] || die "archive contains non-regular files (symlink/device/fifo):
+$bad"
+
+outside=$(find "$STAGE" -mindepth 1 -maxdepth 1 ! -name "$SUBTREE" -printf '%P\n')
+[ -z "$outside" ] || die "archive contains paths outside $SUBTREE/ -- refusing:
+$outside
+Install top.sls and anything else by hand; it decides what runs in dom0."
+
+[ -d "$STAGE/$SUBTREE" ] || die "archive has no $SUBTREE/ directory"
+
+# --- normalise modes in the stage, never in $DEST ----------------------------
+# By the time anything is copied the modes are already right, so no chmod runs
+# against a live dom0 path. Symlinks were rejected above, so these cannot be
+# redirected.
+
+find "$STAGE" -type d -exec chmod 755 {} +
+find "$STAGE" -type f -exec chmod 644 {} +
+for f in qubes-firewall-user-script 90-vif-mtu vpn-up rc.local; do
+    [ -f "$STAGE/$SUBTREE/files/$f" ] || die "archive is missing $SUBTREE/files/$f"
+    chmod 755 "$STAGE/$SUBTREE/files/$f"
+done
+
+# --- review ------------------------------------------------------------------
+
+echo
+echo "=== diff: dom0 $DEST/$SUBTREE  <-  $CONFIG_VM ==="
+# cat -v: this is untrusted content being printed to your terminal. Without it,
+# escape sequences in an added line could repaint or hide the very text you are
+# being asked to approve.
+diff -ruN "$DEST/$SUBTREE" "$STAGE/$SUBTREE" | cat -v || true
+echo "=== end diff ==="
+echo
+read -rp "Install these states into $DEST/$SUBTREE? [y/N] " ans
+case "$ans" in [yY]|[yY][eE][sS]) ;; *) echo "aborted"; exit 1 ;; esac
+
+# --- install -----------------------------------------------------------------
+# Replace the subtree rather than merging into it, so a file deleted upstream
+# actually disappears from dom0 instead of lingering as live state. The old
+# copy is kept until the new one is in place.
+
+# Build the replacement completely, beside the live tree, and only then swap
+# it in. Copying directly over the destination means an interrupted or failed
+# cp leaves a HALF-INSTALLED state tree that the next "qubesctl state.apply
+# vpn" would read as authoritative -- with no indication anything was wrong.
+#
+# The swap itself is two renames on the same filesystem, so the window where
+# $DEST/$SUBTREE does not exist is as short as it can be made without
+# renameat2(RENAME_EXCHANGE).
+
+rm -rf "${DEST:?}/$SUBTREE.new" "${DEST:?}/$SUBTREE.old"
+cp -a "$STAGE/$SUBTREE" "$DEST/$SUBTREE.new"
+chown -R root:root "$DEST/$SUBTREE.new"
+
+if [ -e "$DEST/$SUBTREE" ]; then
+    mv "$DEST/$SUBTREE" "$DEST/$SUBTREE.old"
+fi
+mv "$DEST/$SUBTREE.new" "$DEST/$SUBTREE"
+rm -rf "${DEST:?}/$SUBTREE.old"
+
+echo "installed $DEST/$SUBTREE"

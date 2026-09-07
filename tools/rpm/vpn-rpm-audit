@@ -1,0 +1,557 @@
+#!/bin/bash
+#
+# tools/rpm/vpn-rpm-audit          (RUN IN THE BUILD VM -- never in dom0)
+#
+# usage: vpn-rpm-audit [--tree <dom0-dir>] [--manifest <file>] [--key <keyid>]
+#                      [--max-bytes N] <package.rpm>
+#
+# Interrogate a built .rpm and refuse it unless every property below holds.
+# Nothing here trusts the spec file, the build script, or the person who ran
+# them: it asks the finished package what it contains.
+#
+# WHY THIS EXISTS
+#
+# A GPG signature answers exactly one question -- "did this package leave my
+# build VM unmodified?" It says nothing about whether what left the build VM
+# was safe. Signing a hostile package produces a validly signed hostile
+# package. So the signature is necessary and nowhere near sufficient.
+#
+# It matters more for RPM than it did for the tar this replaces, because an
+# RPM can do things a tar cannot:
+#
+#   - %pre/%post/%preun/%postun/%pretrans/%posttrans scriptlets run AS ROOT IN
+#     dom0 at install time, before you have run anything yourself;
+#   - absolute paths are normal and expected, so there is no "strip leading /"
+#     backstop the way GNU tar has one;
+#   - Obsoletes:/Conflicts: can remove or block other dom0 packages;
+#   - %ghost entries let rpm create and delete paths that are not in the
+#     payload at all;
+#   - the payload is compressed by default, which reintroduces the
+#     decompression-bomb surface the tar workflow deliberately avoided.
+#
+# The one genuine improvement RPM brings is WHERE the checking happens. With
+# tar, dom0 had to inspect the archive itself, so the inspection ran on the
+# machine you were protecting. Here every check below runs in the build VM.
+# If a malformed package crashes a parser, it crashes an ordinary qube.
+# dom0 only ever does two things: verify a signature, and install.
+#
+# That is why this script refuses to run in dom0.
+#
+# EXIT STATUS
+#   0  every check passed
+#   1  at least one check failed  -- do not sign, do not install
+#   2  usage or environment error
+#
+# Checks are all run before reporting, so one failure does not hide the rest.
+
+set -uo pipefail
+
+PROG=vpn-rpm-audit
+
+# --- policy -------------------------------------------------------------------
+
+# Every packaged path must sit under one of these. /etc and /usr/lib are
+# absent on purpose: this project has no business writing a systemd unit, a
+# cron job, a qrexec service or a shell profile into dom0, so if one appears
+# it is not a packaging mistake to be accommodated.
+ALLOWED_PREFIXES=(
+    /usr/local/bin/
+    /etc/qubes/policy.d/
+    /srv/user_salt/
+    /srv/user_pillar/
+    /usr/share/doc/
+    /usr/share/licenses/
+)
+
+# Dependency generation is off in the spec, but rpm adds two families of its
+# own regardless: rpmlib() feature requirements, and a config(NAME) pair for
+# any package carrying %config files. Both are statements about rpm's own
+# format rather than packages to be pulled in, so both are permitted -- and
+# nothing else is. (NAME is substituted once the header has been read, so a
+# package cannot smuggle a dependency in by calling itself something else.)
+REQUIRE_ALLOW_RE='^rpmlib\('
+
+# An uncompressed payload keeps a second parser out of dom0's install path and
+# makes a decompression bomb impossible. build-rpm.sh sets w.ufdio to get it.
+EXPECT_COMPRESSOR='(none)'
+
+# Sanity bounds. This project is a few hundred KiB of text; anything near
+# these numbers means something is wrong, not that the project grew.
+MAX_BYTES=$((4 * 1024 * 1024))     # .rpm file size
+MAX_INSTALLED=$((8 * 1024 * 1024)) # uncompressed installed size
+MAX_RATIO=8                        # installed / file -- caps a bomb
+
+# --- arguments ----------------------------------------------------------------
+
+TREE=""
+MANIFEST=""
+KEYID=""
+RPMFILE=""
+
+die() { echo "$PROG: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --tree)      TREE="${2:-}"; shift 2 || die "--tree needs a value" ;;
+        --manifest)  MANIFEST="${2:-}"; shift 2 || die "--manifest needs a value" ;;
+        --key)       KEYID="${2:-}"; shift 2 || die "--key needs a value" ;;
+        --max-bytes) MAX_BYTES="${2:-}"; shift 2 || die "--max-bytes needs a value" ;;
+        -h|--help)   sed -n '3,8p' "$0"; exit 0 ;;
+        -*)          die "unknown option '$1'" ;;
+        *)           [ -z "$RPMFILE" ] || die "only one package at a time"
+                     RPMFILE="$1"; shift ;;
+    esac
+done
+
+[ -n "$RPMFILE" ] || die "usage: $PROG [--tree DIR] [--manifest FILE] [--key ID] <package.rpm>"
+[ -f "$RPMFILE" ] || die "not a file: $RPMFILE"
+
+# Extracting a payload and running rpm's parsers over attacker-chosen bytes is
+# the entire reason this runs somewhere disposable. In dom0 it would be the
+# problem it is meant to prevent.
+if [ "$(hostname)" = "dom0" ]; then
+    die "refusing to run in dom0 -- audit the package in the build VM, then
+copy only the .rpm across. dom0 should verify the signature and install,
+nothing more."
+fi
+
+command -v rpm     >/dev/null || die "rpm not found"
+command -v rpm2cpio >/dev/null || die "rpm2cpio not found"
+command -v cpio    >/dev/null || die "cpio not found"
+
+# Default the manifest and tree to their in-repo locations when the script is
+# run from a checkout, so the common case needs no arguments.
+here=$(cd "$(dirname "$0")" && pwd)
+[ -n "$MANIFEST" ] || MANIFEST="$here/manifest.txt"
+[ -n "$TREE" ]     || TREE="$here/../../dom0"
+
+# --- result plumbing ----------------------------------------------------------
+
+FAILED=0
+declare -a NOTES
+
+pass() { printf '  ok    %s\n' "$1"; }
+fail() { printf '  FAIL  %s\n' "$1"; FAILED=1; [ $# -lt 2 ] || NOTES+=("$2"); }
+skip() { printf '  --    %s (skipped: %s)\n' "$1" "$2"; }
+
+# rpm writes header parse errors to stderr and still exits 0 in some cases, so
+# query output is captured and emptiness treated as failure everywhere below.
+q() { rpm -qp --nosignature --qf "$1" "$RPMFILE" 2>/dev/null; }
+
+echo "$PROG: $RPMFILE"
+echo
+
+# =============================================================================
+echo "[1] package parses and identifies itself"
+# =============================================================================
+
+NAME=$(q '%{NAME}')
+if [ -z "$NAME" ] || [ "$NAME" = "(none)" ]; then
+    fail "rpm can read the header"
+    echo
+    echo "RESULT: FAILED -- the file is not a readable rpm. Stop here."
+    exit 1
+fi
+pass "header readable: $(q '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}')"
+
+# =============================================================================
+echo "[2] signature"
+# =============================================================================
+# rpmkeys -Kv reports each digest and signature separately. A package that is
+# merely unsigned still prints "digests OK", which is why the test is for the
+# word Signature and not for OK.
+
+sigout=$(rpmkeys -Kv "$RPMFILE" 2>&1)
+if grep -qiE 'NOKEY' <<<"$sigout"; then
+    fail "signature verifies" "public key not in this keyring -- rpmkeys --import it, or this proves nothing"
+elif grep -qiE 'BAD|UNKNOWN|NOT OK|FAILED' <<<"$sigout"; then
+    fail "signature verifies" "rpmkeys reported a bad signature"
+elif ! grep -qi 'signature.*: *OK' <<<"$sigout"; then
+    fail "signature verifies" "package is UNSIGNED (digests alone prove nothing about origin)"
+else
+    pass "signature verifies"
+    if [ -n "$KEYID" ]; then
+        # rpm changed this wording. rpm 4/5 print
+        #     Header V4 RSA/SHA256 Signature, key ID a1b2c3d4e5f60718: OK
+        # with the 16-hex short id; rpm 6 prints
+        #     Header OpenPGP V4 RSA/SHA512 signature, key fingerprint: <40 hex>: OK
+        # Matching only the older wording made this check impossible to pass on
+        # rpm 6 -- a FALSE FAILURE, which is worse than no check at all,
+        # because the reasonable response to it is to stop believing the tool.
+        # Accept either wording.
+        #
+        # The caller may give a full fingerprint, a short id, 0x-prefixed, or
+        # with the spaces gpg puts in fingerprints. Normalise, then match the
+        # given value as a SUFFIX of whatever was printed: a short id is the
+        # trailing 16 hex of the fingerprint, so a short id still matches a
+        # package identified by its full fingerprint.
+        want=$(tr -d ' \t' <<<"${KEYID##*[xX]}" | tr 'A-F' 'a-f')
+        got=$(grep -oiE 'key (id|fingerprint):?[[:space:]]*[0-9a-fA-F]+' <<<"$sigout" \
+              | grep -oiE '[0-9a-fA-F]{8,}' | tr 'A-F' 'a-f' | sort -u)
+
+        if [ -z "$want" ]; then
+            fail "signed by expected key ($KEYID)" "--key value contains no hex digits"
+        elif [ -z "$got" ]; then
+            # Signature verified but no key identifier could be parsed. Do not
+            # silently pass: an unrecognised format means this check did not
+            # actually run.
+            fail "signed by expected key ($KEYID)" \
+                 "could not parse a key id from rpmkeys output -- unrecognised format, check NOT performed:
+$(sed 's/^/      /' <<<"$sigout")"
+        elif grep -qE "${want}\$" <<<"$got"; then
+            pass "signed by expected key ($KEYID)"
+        else
+            fail "signed by expected key ($KEYID)" "signed, but by a different key: $(tr '\n' ' ' <<<"$got")"
+        fi
+    else
+        skip "signed by expected key" "no --key given"
+    fi
+fi
+
+# =============================================================================
+echo "[3] no code runs at install time"
+# =============================================================================
+# The single most important check here. Everything else in this script is
+# about what lands on disk; this is about what EXECUTES as root in dom0
+# before you have looked at anything.
+
+scripts=$(rpm -qp --nosignature --scripts "$RPMFILE" 2>/dev/null)
+if [ -z "$(tr -d '[:space:]' <<<"$scripts")" ]; then
+    pass "no scriptlets (%pre/%post/%preun/%postun/%pretrans/%posttrans)"
+else
+    fail "no scriptlets" "package carries install-time code:
+$(sed 's/^/      /' <<<"$scripts" | head -40)"
+fi
+
+trig=$(rpm -qp --nosignature --triggers "$RPMFILE" 2>/dev/null)
+if [ -z "$(tr -d '[:space:]' <<<"$trig")" ]; then
+    pass "no triggers"
+else
+    fail "no triggers" "package carries trigger scripts"
+fi
+
+ftrig=$(rpm -qp --nosignature --filetriggers "$RPMFILE" 2>/dev/null)
+if [ -z "$(tr -d '[:space:]' <<<"$ftrig")" ]; then
+    pass "no file triggers"
+else
+    fail "no file triggers" "package carries file trigger scripts"
+fi
+
+# =============================================================================
+echo "[4] dependency metadata cannot disturb dom0"
+# =============================================================================
+# Obsoletes: is the dangerous one. A package that obsoletes qubes-core-dom0
+# would have dnf remove the thing that makes the machine a Qubes host.
+
+for tag in OBSOLETENAME CONFLICTNAME RECOMMENDNAME SUGGESTNAME SUPPLEMENTNAME ENHANCENAME; do
+    v=$(q "[%{$tag} ]")
+    v=$(tr -d '[:space:]' <<<"$v")
+    if [ -z "$v" ] || [ "$v" = "(none)" ]; then
+        pass "no ${tag%NAME} entries"
+    else
+        fail "no ${tag%NAME} entries" "${tag%NAME}: $(q "[%{$tag} ]")"
+    fi
+done
+
+SELF_RE="^config\\(${NAME}\\)\$"
+
+badreq=""
+while read -r r; do
+    [ -n "$r" ] || continue
+    [[ "$r" =~ $REQUIRE_ALLOW_RE ]] && continue
+    [[ "$r" =~ $SELF_RE ]] && continue
+    badreq+="$r "
+done < <(q '[%{REQUIRENAME}\n]')
+if [ -z "$badreq" ]; then
+    pass "Requires limited to rpmlib() features"
+else
+    fail "Requires limited to rpmlib() features" "unexpected: $badreq"
+fi
+
+badprov=""
+while read -r r; do
+    [ -n "$r" ] || continue
+    [ "$r" = "$NAME" ] && continue
+    [[ "$r" =~ $SELF_RE ]] && continue
+    badprov+="$r "
+done < <(q '[%{PROVIDENAME}\n]')
+if [ -z "$badprov" ]; then
+    pass "Provides only its own name"
+else
+    fail "Provides only its own name" "also provides: $badprov"
+fi
+
+# =============================================================================
+echo "[5] payload shape"
+# =============================================================================
+
+comp=$(q '%{PAYLOADCOMPRESSOR}')
+if [ "$comp" = "$EXPECT_COMPRESSOR" ]; then
+    pass "payload uncompressed (no bomb, no second parser in dom0)"
+else
+    fail "payload uncompressed" "compressor is '$comp', expected '$EXPECT_COMPRESSOR' -- build with %define _binary_payload w.ufdio"
+fi
+
+fmt=$(q '%{PAYLOADFORMAT}')
+[ "$fmt" = "cpio" ] && pass "payload format cpio" \
+                    || fail "payload format cpio" "format is '$fmt'"
+
+filebytes=$(stat -c %s "$RPMFILE")
+installed=$(q '%{LONGSIZE}')
+[ -n "$installed" ] && [ "$installed" != "(none)" ] || installed=0
+
+if [ "$filebytes" -le "$MAX_BYTES" ]; then
+    pass "file size ${filebytes}B within ${MAX_BYTES}B"
+else
+    fail "file size within ${MAX_BYTES}B" "package is ${filebytes}B"
+fi
+
+if [ "$installed" -le "$MAX_INSTALLED" ]; then
+    pass "installed size ${installed}B within ${MAX_INSTALLED}B"
+else
+    fail "installed size within ${MAX_INSTALLED}B" "claims ${installed}B installed"
+fi
+
+# The quotient is computed once, before the test. Working it out inside the
+# "if" and again inside the "else" divides by zero on the else path, because
+# the guard that made the if safe is exactly what sent us to the else.
+if [ "$filebytes" -gt 0 ]; then
+    ratio=$((installed / filebytes))
+    if [ "$ratio" -le "$MAX_RATIO" ]; then
+        pass "expansion ratio ${ratio}x within ${MAX_RATIO}x"
+    else
+        fail "expansion ratio within ${MAX_RATIO}x" \
+             "${ratio}x -- a small package claiming a large install is the shape of a bomb"
+    fi
+else
+    fail "expansion ratio within ${MAX_RATIO}x" "package file is zero bytes"
+fi
+
+# =============================================================================
+echo "[6] every packaged path"
+# =============================================================================
+# Filename is printed LAST so that a name containing spaces cannot shift the
+# fields in front of it. Names are then checked before they are used anywhere.
+
+S_IFMT=61440; S_IFREG=32768; S_IFDIR=16384
+
+declare -A pkg_mode pkg_digest pkg_flags
+badpaths=(); badtypes=(); badmodes=(); badowners=(); badflags=()
+
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    meta="${line%%::*}"
+    path="${line#*:: }"
+    read -r m owner group fl link <<<"$meta"
+    fl="${fl%.}"; link="${link%.}"
+
+    # -- name: absolute, no traversal, no doubled slash, printable ASCII only.
+    #    Anything else is rejected before the path is used to index anything.
+    if   [[ "$path" != /* ]];                       then badpaths+=("$path  (not absolute)")
+    elif [[ "$path" == *//* ]];                     then badpaths+=("$path  (doubled slash)")
+    elif [[ "/$path/" == */../* ]];                 then badpaths+=("$path  (parent traversal)")
+    elif [[ "$path" =~ [[:cntrl:]] ]];              then badpaths+=("$(printf '%q' "$path")  (control character -- can repaint your terminal)")
+    elif [[ "$path" =~ [^[:print:]] ]];             then badpaths+=("$(printf '%q' "$path")  (non-printable)")
+    elif [[ "$path" =~ [[:space:]] ]];              then badpaths+=("$(printf '%q' "$path")  (whitespace)")
+    else
+        inside=0
+        for p in "${ALLOWED_PREFIXES[@]}"; do
+            [[ "$path" == "$p"* ]] && { inside=1; break; }
+        done
+        [ "$inside" = 1 ] || badpaths+=("$path  (outside every allowed prefix)")
+    fi
+
+    mode=$((8#$m))
+    type=$((mode & S_IFMT))
+    perm=$((mode & 4095))
+
+    # -- type: regular files and directories only. A symlink is how you get a
+    #    later write, or a later chmod, to land on a real dom0 path.
+    if [ "$type" -ne "$S_IFREG" ] && [ "$type" -ne "$S_IFDIR" ]; then
+        case "$type" in
+            40960) what="symlink -> $link" ;;
+             8192) what="character device" ;;
+            24576) what="block device" ;;
+             4096) what="fifo" ;;
+            49152) what="socket" ;;
+                *) what="unknown type" ;;
+        esac
+        badtypes+=("$path  ($what)")
+    fi
+
+    # -- mode: no setuid, setgid, sticky, or group/world write.
+    (( perm & 2048 )) && badmodes+=("$path  (setuid, mode $m)")
+    (( perm & 1024 )) && badmodes+=("$path  (setgid, mode $m)")
+    (( perm & 512  )) && badmodes+=("$path  (sticky, mode $m)")
+    (( perm & 2    )) && badmodes+=("$path  (world-writable, mode $m)")
+    (( perm & 16   )) && badmodes+=("$path  (group-writable, mode $m)")
+
+    [ "$owner" = "root" ] && [ "$group" = "root" ] \
+        || badowners+=("$path  ($owner:$group)")
+
+    # -- flags: %ghost is a path rpm creates and DELETES without it ever being
+    #    in the payload, so nothing you inspected covers it. %missingok
+    #    likewise excuses a file from verification.
+    [[ "$fl" == *g* ]] && badflags+=("$path  (%ghost -- not in the payload at all)")
+    [[ "$fl" == *m* ]] && badflags+=("$path  (%missingok -- exempt from rpm -V)")
+
+    pkg_mode["$path"]="$perm"
+    pkg_flags["$path"]="$fl"
+    [ "$type" -eq "$S_IFDIR" ] && pkg_digest["$path"]="dir"
+done < <(q '[%{FILEMODES:octal} %{FILEUSERNAME} %{FILEGROUPNAME} %{FILEFLAGS:fflags}. %{FILELINKTOS}. :: %{FILENAMES}\n]')
+
+# Digests need their own pass: FILEDIGESTS is empty for directories, which
+# would silently shift a combined --qf record.
+while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    d="${line%%::*}"; p="${line#*:: }"
+    [ "${pkg_digest[$p]:-}" = "dir" ] || pkg_digest["$p"]="$(tr -d '[:space:]' <<<"$d")"
+done < <(q '[%{FILEDIGESTS} :: %{FILENAMES}\n]')
+
+report_list() {
+    local label="$1"; shift
+    if [ $# -eq 0 ]; then pass "$label"
+    else fail "$label" "$(printf '%s\n' "$@" | sed 's/^/      /')"; fi
+}
+report_list "all paths well-formed and inside allowed prefixes" "${badpaths[@]+"${badpaths[@]}"}"
+report_list "only regular files and directories"                "${badtypes[@]+"${badtypes[@]}"}"
+report_list "no setuid/setgid/sticky/group- or world-writable"  "${badmodes[@]+"${badmodes[@]}"}"
+report_list "everything owned root:root"                        "${badowners[@]+"${badowners[@]}"}"
+report_list "no %ghost or %missingok entries"                   "${badflags[@]+"${badflags[@]}"}"
+
+# =============================================================================
+echo "[7] contents match the reviewed manifest exactly"
+# =============================================================================
+
+if [ ! -f "$MANIFEST" ]; then
+    skip "package matches manifest" "no manifest at $MANIFEST"
+else
+    declare -A want_mode want_flags
+    while read -r m relpath flags; do
+        [ -n "${m:-}" ] || continue
+        [[ "$m" == \#* ]] && continue
+        want_mode["/$relpath"]=$((8#$m))
+        want_flags["/$relpath"]="${flags:-}"
+    done < <(grep -vE '^\s*(#|$)' "$MANIFEST")
+
+    missing=(); extra=(); wrongmode=(); wrongconfig=()
+    for p in "${!want_mode[@]}"; do
+        [ -n "${pkg_mode[$p]+x}" ] || missing+=("$p")
+    done
+    for p in "${!pkg_mode[@]}"; do
+        if [ -z "${want_mode[$p]+x}" ]; then
+            # %doc and %license land in generated directories nobody lists.
+            case "$p" in /usr/share/doc/*|/usr/share/licenses/*) ;; *) extra+=("$p") ;; esac
+            continue
+        fi
+        [ "${pkg_mode[$p]}" -eq "${want_mode[$p]}" ] \
+            || wrongmode+=("$p  is $(printf '%04o' "${pkg_mode[$p]}"), manifest says $(printf '%04o' "${want_mode[$p]}")")
+
+        # %config(noreplace) is the difference between an upgrade preserving
+        # your edits to top.sls and silently reverting them. Check both ways:
+        # a listed file that is not config, and a config file nobody listed.
+        if [[ "${want_flags[$p]}" == *config* ]]; then
+            [[ "${pkg_flags[$p]}" == *c* ]] \
+                || wrongconfig+=("$p  manifest says config, package does not mark it")
+        else
+            [[ "${pkg_flags[$p]}" != *c* ]] \
+                || wrongconfig+=("$p  marked %config in the package, not in the manifest")
+        fi
+    done
+
+    report_list "no manifest entry missing from the package" "${missing[@]+"${missing[@]}"}"
+    report_list "no path in the package beyond the manifest" "${extra[@]+"${extra[@]}"}"
+    report_list "every mode matches the manifest"            "${wrongmode[@]+"${wrongmode[@]}"}"
+    report_list "%config marking matches the manifest"       "${wrongconfig[@]+"${wrongconfig[@]}"}"
+fi
+
+# =============================================================================
+echo "[8] file contents match the reviewed source tree"
+# =============================================================================
+# This is what turns the signature into something meaningful. The signature
+# says the package left the build VM intact; this says the package contains
+# the bytes you actually read, and no others.
+
+if [ ! -d "$TREE" ]; then
+    skip "digests match $TREE" "no such directory"
+else
+    baddigest=(); nosource=()
+    for p in "${!pkg_digest[@]}"; do
+        [ "${pkg_digest[$p]}" = "dir" ] && continue
+        case "$p" in /usr/share/doc/*|/usr/share/licenses/*) continue ;; esac
+        src="$TREE${p}"
+        if [ ! -f "$src" ]; then
+            nosource+=("$p  (no counterpart at $src)")
+            continue
+        fi
+        want=$(sha256sum "$src" | cut -d' ' -f1)
+        [ "$want" = "${pkg_digest[$p]}" ] \
+            || baddigest+=("$p
+        package: ${pkg_digest[$p]}
+        source : $want")
+    done
+    report_list "every file digest matches the source tree" "${baddigest[@]+"${baddigest[@]}"}"
+    report_list "every packaged file has a source counterpart" "${nosource[@]+"${nosource[@]}"}"
+fi
+
+# =============================================================================
+echo "[9] the payload really is what the header claims"
+# =============================================================================
+# Steps 6 to 8 all read the HEADER. The header is covered by the signature, and
+# rpm 4.14+ binds the payload to it with a payload digest -- but that is rpm
+# checking rpm. Unpacking here costs nothing and does not take rpm's word for
+# it. Safe to do because it happens in the build VM: an unpleasant payload
+# ruins a scratch directory in a qube you can delete.
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/vpn-rpm-audit.XXXXXX") || die "mktemp failed"
+chmod 700 "$scratch"
+trap 'rm -rf "$scratch"' EXIT
+
+# --no-absolute-filenames keeps the (absolute, by design) member names inside
+# the scratch directory. Unprivileged, so the kernel refuses device nodes and
+# root ownership whatever the payload asks for.
+if rpm2cpio "$RPMFILE" 2>/dev/null \
+     | cpio -idm --quiet --no-absolute-filenames -D "$scratch" 2>/dev/null; then
+
+    oddities=$(find "$scratch" -mindepth 1 ! -type f ! -type d)
+    [ -z "$oddities" ] \
+        && pass "payload holds only regular files and directories" \
+        || fail "payload holds only regular files and directories" "$(sed 's/^/      /' <<<"$oddities")"
+
+    mismatch=(); unlisted=()
+    while IFS= read -r f; do
+        # Quoted inside ${..#..} so a TMPDIR containing a glob character is
+        # stripped literally rather than treated as a pattern.
+        rel="${f#"$scratch"}"
+        if [ -z "${pkg_digest[$rel]+x}" ]; then
+            unlisted+=("$rel  (in payload, absent from header)")
+            continue
+        fi
+        got=$(sha256sum "$f" | cut -d' ' -f1)
+        [ "$got" = "${pkg_digest[$rel]}" ] || mismatch+=("$rel  (payload bytes differ from header digest)")
+    done < <(find "$scratch" -type f)
+
+    report_list "payload bytes agree with header digests" "${mismatch[@]+"${mismatch[@]}"}"
+    report_list "no payload member absent from the header" "${unlisted[@]+"${unlisted[@]}"}"
+else
+    fail "payload extracts cleanly" "rpm2cpio or cpio failed -- treat the package as malformed"
+fi
+
+# =============================================================================
+
+echo
+if [ "$FAILED" -eq 0 ]; then
+    echo "RESULT: PASSED -- every check above."
+    echo
+    echo "This says the package is well formed, confined to the reviewed"
+    echo "manifest, runs no install-time code, and contains exactly the bytes"
+    echo "in $TREE. It does NOT say that source is safe to run as root."
+    echo "Read it. That check has no script."
+    exit 0
+fi
+
+echo "RESULT: FAILED"
+echo
+for n in "${NOTES[@]+"${NOTES[@]}"}"; do echo "$n"; echo; done
+echo "Do not sign this package, and do not copy it to dom0."
+exit 1

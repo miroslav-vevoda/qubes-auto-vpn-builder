@@ -1,0 +1,150 @@
+#!/bin/bash
+#
+# /usr/local/bin/vpn-build          (dom0)
+#
+# usage: vpn-build [<path-under-/home/user>]     default: vpn-selection.conf
+#
+# End-to-end build of ONE VPN qube. Run from dom0 only. This is the single
+# command that determines where everything comes from -- neither
+# salt-configs-vm nor vpn-config-files-vm can name the other, and neither can
+# name the target.
+#
+# Order matters: the firewall is applied BEFORE any config is pushed and
+# before the disposable is ever started, so the qube is never briefly open.
+#
+# To build several qubes from a directory of numbered configs, use
+# vpn-build-all, which validates the whole set first and then calls this once
+# per config.
+#
+# The path argument is also useful by hand, to rebuild ONE member of a set
+# without touching the others:
+#
+#     vpn-build vpn-configs/20-de77.conf
+#
+# uplink is read from that file as usual, so a chained qube stays chained.
+# What is lost is the cross-config validation: seeing one file, this cannot
+# check the mtu against its parent or notice a name collision with another
+# config. Run "vpn-build-all -n" first if more than that one file changed.
+
+set -euo pipefail
+
+die() { echo "vpn-build: $*" >&2; exit 1; }
+step() { echo; echo "== $* =="; }
+
+VPNCONF_VM="vpn-config-files-vm"
+
+# Everything below drives qubesctl, qvm-firewall and qrexec as dom0. Running it
+# anywhere else fails partway with confusing errors rather than up front.
+[ "$(hostname)" = "dom0" ] || die "must be run in dom0 (hostname is '$(hostname)')"
+
+# No qrexec call here should be able to hang the build indefinitely. The config
+# push moves real files, so it gets a longer budget than the metadata calls.
+QREXEC_TIMEOUT=120
+
+CONFIG_REL="${1:-vpn-selection.conf}"
+
+step "1/7  validate parameters from salt-configs-vm  ($CONFIG_REL)"
+# vpn-params-fetch validates the path as well as the contents; nothing here
+# needs to pre-screen it.
+/usr/local/bin/vpn-params-fetch "$CONFIG_REL"
+
+read_pillar() { grep -E "^  $1:" /srv/user_pillar/vpn.sls | sed -E "s/^  $1: *'?([^']*)'?$/\1/"; }
+country=$(read_pillar country)
+server=$(read_pillar server)
+mode=$(read_pillar mode)
+transport=$(read_pillar transport)
+uplink=$(read_pillar uplink)
+dvm=$(read_pillar dvm_template)
+disp=$(read_pillar dispvm)
+[ -n "$dvm" ] && [ -n "$disp" ] || die "could not read derived names from pillar"
+[ -n "$transport" ] || die "could not read transport from pillar"
+[ -n "$uplink" ] || die "could not read uplink from pillar"
+
+step "2/7  create qubes  ($dvm, $disp)"
+qubesctl --show-output state.apply vpn
+
+step "3/7  place files inside $dvm"
+qubesctl --skip-dom0 --targets="$dvm" --show-output state.apply vpn.vmfiles
+
+step "4/7  fetch and validate endpoints for $country"
+if [ "$mode" = "random" ]; then
+    mapfile -t endpoints < <(/usr/local/bin/vpn-endpoints-fetch "$country")
+else
+    mapfile -t endpoints < <(/usr/local/bin/vpn-endpoints-fetch "$country" "$server")
+fi
+[ "${#endpoints[@]}" -gt 0 ] || die "no endpoints"
+echo "${#endpoints[@]} endpoint(s) whitelisted"
+
+step "5/7  apply firewall to $disp  (before any config exists)"
+/usr/local/bin/vpn-firewall-apply -p "$transport" "$disp" "${endpoints[@]}"
+
+step "6/7  push configs $VPNCONF_VM -> $dvm"
+# The tag set by salt is what the qubes.Filecopy policy keys on. dom0 decides
+# who is tagged; the config qube never learns the target from anywhere else.
+if [ "$mode" = "random" ]; then sel="ALL"; else sel="$server"; fi
+printf '%s %s %s\n' "$dvm" "$country" "$sel" \
+    | timeout "$QREXEC_TIMEOUT" \
+      qrexec-client -d "$VPNCONF_VM" "DEFAULT:QUBESRPC custom.VpnConfigPush dom0" \
+    || die "config push failed (or timed out after ${QREXEC_TIMEOUT}s)"
+
+step "7/7  secure the delivered configs in $dvm"
+# qvm-copy-to-vm drops files in the template's home directory with whatever
+# mode they had. Move them into the root-owned 0700 directory and clear the
+# inbox, so the persistent copy is not left readable in /home/user.
+qvm-run --no-gui -u root "$dvm" '
+    set -e
+    mkdir -p /rw/config/vpn && chmod 700 /rw/config/vpn && chown root:root /rw/config/vpn
+    find /home/user/QubesIncoming -type f \
+        \( -name "*.conf" -o -name "endpoint-map.txt" -o -name "auth-user-pass.txt" \) \
+        -exec mv -t /rw/config/vpn {} + 2>/dev/null || true
+    chown root:root /rw/config/vpn/* 2>/dev/null || true
+    chmod 600 /rw/config/vpn/*.conf 2>/dev/null || true
+    chmod 600 /rw/config/vpn/auth-user-pass.txt 2>/dev/null || true
+    chmod 644 /rw/config/vpn/endpoint-map.txt 2>/dev/null || true
+    rm -rf /home/user/QubesIncoming
+' || die "could not secure configs inside $dvm"
+
+# The copy started the template. It is meant never to run, so put it back.
+qvm-shutdown --wait "$dvm" || echo "warning: could not shut down $dvm" >&2
+
+cat <<DONE
+
+Build complete.
+
+  dvm template : $dvm      (netvm none, never runs)
+  disposable   : $disp     (start this; use it as netvm downstream)
+  mode         : $mode ${server:+($server)}
+  transport    : $transport
+  uplink       : $uplink
+  endpoints    : ${#endpoints[@]} whitelisted
+DONE
+
+# An uplink of none is a supported choice, not a failure -- but the qube it
+# produces cannot reach its endpoint, so say so rather than printing a
+# "qvm-start" line that would appear to work and then not.
+if [ "$uplink" = "none" ]; then
+    cat <<DONE
+
+This qube has NO UPLINK (uplink=none), so the tunnel cannot come up until one
+is attached. Everything else is built: firewall applied, configs delivered.
+
+Attach an uplink, then start it:
+  qvm-prefs $disp netvm <sys-firewall|another-vpn-qube>
+  qvm-start $disp
+DONE
+else
+    cat <<DONE
+
+Next:
+  qvm-start $disp
+  qvm-prefs <some-qube> netvm $disp
+DONE
+fi
+
+cat <<DONE
+
+Verify:
+  qvm-run $disp 'sudo journalctl -t vpn-up -t qubes-fw-user'
+  qvm-run $disp 'sudo nft list chain ip qubes custom-forward'
+  qvm-run $disp 'sudo nft list chain ip6 qubes custom-forward'
+DONE

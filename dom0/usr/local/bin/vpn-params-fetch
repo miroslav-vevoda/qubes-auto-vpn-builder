@@ -1,0 +1,193 @@
+#!/bin/bash
+#
+# /usr/local/bin/vpn-params-fetch          (dom0)
+#
+# usage: vpn-params-fetch [-n] [<path-under-/home/user>]
+#
+# Read a selection file from salt-configs-vm, validate every field against a
+# whitelist, derive the qube names, and write /srv/user_pillar/vpn.sls.
+#
+#   vpn-params-fetch                         -> ~/vpn-selection.conf
+#   vpn-params-fetch vpn-configs/10-uk.conf  -> ~/vpn-configs/10-uk.conf
+#   vpn-params-fetch -n <path>               -> validate only, write nothing
+#
+# -n exists for vpn-build-all, which must validate an entire set of configs
+# BEFORE it creates the first qube. It prints the derived values as key=value
+# lines on stdout and leaves the pillar untouched.
+#
+# The input is UNTRUSTED -- both the file contents and the path. Both are only
+# ever matched against regexes; neither is eval'd, and neither reaches a shell
+# command line before it has been validated.
+
+set -euo pipefail
+
+CONFIG_VM="salt-configs-vm"
+CONFIG_HOME="/home/user"
+PILLAR_OUT="/srv/user_pillar/vpn.sls"
+BASE_TEMPLATE="${VPN_BASE_TEMPLATE:-fedora-42-xfce}"
+
+# The settings file is a dozen short lines. Bound the read so dom0 never sizes
+# a buffer from an AppVM's output, and never waits on one forever.
+MAX_BYTES=65536
+TIMEOUT=60
+
+die() { echo "vpn-params-fetch: $*" >&2; exit 1; }
+
+[ "$(hostname)" = "dom0" ] || die "must be run in dom0 (hostname is '$(hostname)')"
+
+dry_run=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -n) dry_run=1; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option $1" ;;
+        *)  break ;;
+    esac
+done
+
+rel="${1:-vpn-selection.conf}"
+
+# This is interpolated into a command line that runs in another qube, so it is
+# validated first and to a deliberately narrow charset: no spaces, no quotes,
+# no shell metacharacters, no leading "-" that could be read as an option.
+# ".." is rejected outright rather than normalised -- dom0 has no business
+# guessing what a path with ".." in it was meant to mean.
+[[ "$rel" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] \
+    || die "bad config path '$rel' (letters, digits, . _ - and / only)"
+case "/$rel/" in */../*) die "config path may not contain '..'" ;; esac
+[ "${#rel}" -le 128 ] || die "config path is too long"
+
+CONFIG_PATH="$CONFIG_HOME/$rel"
+
+raw=$(timeout "$TIMEOUT" qvm-run --pass-io --no-gui "$CONFIG_VM" "cat '$CONFIG_PATH'" \
+      | head -c "$MAX_BYTES") \
+    || die "cannot read $CONFIG_PATH from $CONFIG_VM (or it timed out / exceeded ${MAX_BYTES} bytes)"
+
+protocol=""; mtu=""; selector=""; provider=""; transport=""; uplink=""
+
+# A repeated key silently taking the last value is exactly the kind of thing
+# that makes a config look like it says one thing while doing another. Refuse
+# it instead: the file is short and hand-edited, so a duplicate is a mistake.
+declare -A seen=()
+
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(trim "$line")"
+    [ -z "$line" ] && continue
+    [[ "$line" == *=* ]] || die "malformed line: $line"
+    key="$(trim "${line%%=*}")"; val="$(trim "${line#*=}")"
+    # Whitespace is trimmed from the EDGES only. Stripping it everywhere --
+    # which is what this did originally -- silently turns "uplink=sys firewall"
+    # into "sysfirewall": a value that then passes the qube-name charset and
+    # points at something nobody named. Internal whitespace is a typo, and a
+    # config that reads one way and behaves another is the exact failure this
+    # parser's duplicate-key check already exists to prevent.
+    [[ "$key" =~ [[:space:]] ]] && die "key contains whitespace: '$key'"
+    [[ "$val" =~ [[:space:]] ]] && die "value for '$key' contains whitespace: '$val'"
+    [ -z "${seen[$key]+x}" ] || die "key '$key' appears more than once"
+    seen[$key]=1
+    case "$key" in
+        protocol)  protocol="$val" ;;
+        mtu)       mtu="$val" ;;
+        selector)  selector="$val" ;;
+        provider)  provider="$val" ;;
+        transport) transport="$val" ;;
+        uplink)    uplink="$val" ;;
+        *)         die "unknown key '$key'" ;;
+    esac
+done <<< "$raw"
+
+[[ "$protocol" =~ ^(wireguard|openvpn)$ ]] || die "protocol must be wireguard or openvpn"
+[[ "$mtu"      =~ ^[0-9]{3,4}$ ]]          || die "mtu must be numeric"
+[ "$mtu" -ge 1280 ] && [ "$mtu" -le 1500 ] || die "mtu $mtu outside 1280-1500"
+[[ "$provider" =~ ^[a-z][a-z0-9]{1,15}$ ]] || die "bad provider '$provider'"
+[[ "$selector" =~ ^[a-z]{2}([0-9]{1,4})?$ ]] || die "bad selector '$selector'"
+
+# Transport is what the dom0 firewall whitelists. WireGuard is UDP by
+# definition; OpenVPN may be either, and getting it wrong means the endpoint
+# is silently unreachable, so it is an explicit setting rather than a guess.
+transport="${transport:-udp}"
+[[ "$transport" =~ ^(udp|tcp)$ ]] || die "transport must be udp or tcp"
+if [ "$protocol" = "wireguard" ] && [ "$transport" != "udp" ]; then
+    die "wireguard is always udp; transport=$transport is not valid with it"
+fi
+
+# Uplink defaults to none, never to sys-firewall. An omitted key must never
+# hand the qube a network path it was not asked for -- the same fail-closed
+# stance dvmtemplate.sls takes for the template. "none" is also a legitimate
+# deliberate value: build the qube now, attach it by hand later.
+#
+# Whatever this ends up as goes straight to qvm-prefs via dispvm.sls, so the
+# charset is Qubes' own name charset and nothing wider.
+uplink="${uplink:-none}"
+[[ "$uplink" =~ ^(none|[A-Za-z0-9_][A-Za-z0-9._-]{0,30})$ ]] || die "bad uplink '$uplink'"
+
+country="${selector:0:2}"
+if [ "${#selector}" -eq 2 ]; then
+    mode="random";   server="";         stem="${country}-random"
+else
+    mode="specific"; server="$selector"; stem="$server"
+fi
+
+dvm_template="${provider}-${stem}-vpn-dvm"
+dispvm="${provider}-${stem}-vpn"
+for n in "$dvm_template" "$dispvm"; do
+    [ "${#n}" -le 31 ] || die "derived name '$n' exceeds the 31-char qube name limit"
+done
+
+# A qube cannot be its own uplink. Cheap to check here, and it catches the
+# copy-paste mistake that vpn-build-all's ordering rule would otherwise only
+# catch when the config is part of a set.
+[ "$uplink" != "$dispvm" ] || die "uplink '$uplink' is this config's own disposable"
+
+if [ "$protocol" = "wireguard" ]; then vpn_if="wireguard"; else vpn_if="vpn0"; fi
+
+# --- dry run: report, write nothing -------------------------------------------
+# Machine-readable on purpose. vpn-build-all parses these lines to do the
+# cross-config checks (name collisions, uplink ordering, MTU descent) that no
+# single file can be validated against.
+
+if [ "$dry_run" = 1 ]; then
+    cat <<SUMMARY
+config=$rel
+provider=$provider
+protocol=$protocol
+transport=$transport
+mtu=$mtu
+mode=$mode
+country=$country
+server=$server
+dvm_template=$dvm_template
+dispvm=$dispvm
+uplink=$uplink
+vpn_if=$vpn_if
+SUMMARY
+    exit 0
+fi
+
+umask 022
+cat > "$PILLAR_OUT" <<PILLAR
+# GENERATED by vpn-params-fetch on $(date -Is) from $rel. Do not edit by hand.
+vpn:
+  provider: $provider
+  protocol: $protocol
+  transport: $transport
+  mtu: $mtu
+  mode: $mode
+  country: $country
+  server: '$server'
+  dvm_template: $dvm_template
+  dispvm: $dispvm
+  base_template: $BASE_TEMPLATE
+  uplink: $uplink
+  vpn_if: $vpn_if
+PILLAR
+
+echo "wrote $PILLAR_OUT  (from $rel)"
+echo "  mode=$mode country=$country server=${server:-<random>}"
+echo "  protocol=$protocol transport=$transport vpn_if=$vpn_if"
+echo "  uplink=$uplink"
+echo "  dvm_template=$dvm_template"
+echo "  dispvm=$dispvm"

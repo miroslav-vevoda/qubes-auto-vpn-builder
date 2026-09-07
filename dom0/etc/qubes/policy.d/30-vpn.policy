@@ -1,0 +1,33 @@
+## /etc/qubes/policy.d/30-vpn.policy
+##
+## Isolation between the two storage qubes is enforced HERE, not by convention.
+##
+##  - salt-configs-vm never appears as a source or target below. It holds no
+##    secrets and is only ever read by dom0 via qvm-run, on dom0's initiative.
+##  - vpn-config-files-vm may hand out endpoint metadata to dom0, and may copy
+##    config files ONLY to a qube dom0 has tagged vpn-endpoint.
+##  - Neither qube can name or reach the other.
+
+## dom0 asks for the endpoint map of one country. Returns metadata only --
+## never config bodies, never key material.
+custom.VpnEndpointList  *  @adminvm  vpn-config-files-vm  allow user=user
+custom.VpnEndpointList  *  @anyvm    @anyvm               deny
+
+## dom0 tells vpn-config-files-vm to push configs to a tagged target. The
+## service resolves and validates the paths itself; dom0 passes only names.
+custom.VpnConfigPush    *  @adminvm  vpn-config-files-vm  allow user=user
+custom.VpnConfigPush    *  @anyvm    @anyvm               deny
+
+## The actual file transfer. Scoped by TAG, so it follows whichever qube dom0
+## has designated -- and reaches nothing else. Place these ABOVE the default
+## qubes.Filecopy rules in 90-default.policy.
+qubes.Filecopy  *  vpn-config-files-vm  @tag:vpn-endpoint  allow
+qubes.Filecopy  *  vpn-config-files-vm  @anyvm             deny
+
+## The VPN qube holds live key material. Nothing may pull files back out of it.
+##
+## Both the dvm template AND the named disposable carry the tag (see
+## dvmtemplate.sls and dispvm.sls). Tagging only the template would leave this
+## denial covering a qube that never runs, while the disposable that actually
+## has the keys loaded fell through to 90-default.policy.
+qubes.Filecopy  *  @tag:vpn-endpoint    @anyvm             deny

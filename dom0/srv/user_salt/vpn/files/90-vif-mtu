@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# /rw/config/network-hooks.d/90-vif-mtu          (mode 0755)
+#
+# Called by vif-route-qubes as:  90-vif-mtu <command> <vif>
+# Sets the MTU on downstream qube interfaces so their packets fit inside the
+# tunnel. Runs with a bare environment, so MTU must be sourced, not inherited.
+
+[ -r /rw/config/vpn-params ] && . /rw/config/vpn-params
+
+command="$1"
+vif="$2"
+
+[ "$command" = "online" ] || exit 0
+[ -n "${MTU:-}" ] || exit 0
+
+case "$vif" in
+    vif[0-9]*)
+        ip link set dev "$vif" mtu "$MTU"
+        logger -t vpn-vif-mtu "set $vif mtu $MTU"
+        ;;
+esac
+exit 0

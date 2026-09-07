@@ -1,0 +1,79 @@
+#!/bin/bash
+#
+# /usr/local/bin/vpn-firewall-apply          (dom0)
+#
+# usage: vpn-firewall-apply [-p udp|tcp] <vm> <ip:port> [ip:port ...]
+#
+# <vm> must be the NAMED DISPOSABLE. Rules on the dvm template never filter
+# anything, because the template's netvm is none and it never runs.
+#
+# Final ruleset:
+#   0  drop specialtarget=dns
+#   1  drop proto=icmp
+#   2..N accept <proto> <endpoint>
+#   N+1 drop
+#
+# The trailing drop has no address family, so it covers IPv6 as well.
+#
+# Note that dropping DNS means the qube cannot resolve hostnames. That is
+# deliberate, and it is why vpn-up rewrites an OpenVPN "remote" to the
+# whitelisted IP instead of leaving a hostname in place.
+
+set -euo pipefail
+
+PROTO="udp"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -p) PROTO="${2:?-p needs a value}"; shift 2 ;;
+        --) shift; break ;;
+        -*) echo "unknown option $1" >&2; exit 1 ;;
+        *)  break ;;
+    esac
+done
+
+[[ "$PROTO" =~ ^(udp|tcp)$ ]] || { echo "proto must be udp or tcp" >&2; exit 1; }
+
+VM="${1:?usage: vpn-firewall-apply [-p udp|tcp] <vm> <ip:port> ...}"; shift
+[ "$#" -gt 0 ] || { echo "no endpoints given" >&2; exit 1; }
+
+qvm-firewall "$VM" reset
+# Deterministic: reset leaves exactly one blanket accept at index 0. Delete it
+# immediately, while the index is unambiguous -- not after appending rules.
+qvm-firewall "$VM" del --rule-no 0
+
+# This is the last gate before an address becomes a firewall rule, so it
+# repeats the range and leading-zero checks vpn-endpoints-fetch already does
+# rather than assuming its caller. "010.0.0.1" is read as octal by some tools
+# and decimal by others; whitelisting it would permit an address nobody chose.
+valid_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    local o
+    for o in "${BASH_REMATCH[@]:1:4}"; do
+        [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+        (( o <= 255 )) || return 1
+    done
+    return 0
+}
+
+for ep in "$@"; do
+    ip="${ep%:*}"; port="${ep##*:}"
+    valid_ipv4 "$ip"                || { echo "bad ip $ip" >&2; exit 1; }
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) \
+                                    || { echo "bad port $port" >&2; exit 1; }
+    qvm-firewall "$VM" add accept proto="$PROTO" dst4="$ip" dstports="$port"
+done
+
+qvm-firewall "$VM" add --before 0 drop proto=icmp
+qvm-firewall "$VM" add --before 0 drop specialtarget=dns
+qvm-firewall "$VM" add drop
+
+echo "--- $VM firewall ($PROTO) ---"
+qvm-firewall "$VM" list
+
+# Assert the last rule is an unconditional drop, rather than merely printing it.
+last=$(qvm-firewall "$VM" list | tail -n 1)
+case "$last" in
+    *drop*) ;;
+    *) echo "ASSERTION FAILED: last rule is not a drop: $last" >&2; exit 1 ;;
+esac
+echo "ok: terminal drop present"

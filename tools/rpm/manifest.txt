@@ -1,0 +1,70 @@
+# tools/rpm/manifest.txt
+#
+# THE reviewed list of what may end up in dom0. Two things read this file:
+#
+#   build-rpm.sh    generates the spec's %files section from it
+#   vpn-rpm-audit   checks the BUILT package against it
+#
+# They are deliberately separate directions. build-rpm.sh says what the
+# package should contain; vpn-rpm-audit asks the finished .rpm what it
+# actually contains and compares. A build that goes wrong -- or a spec edited
+# behind your back -- shows up as a mismatch rather than as agreement.
+#
+# So this file is the thing to review. If a path is not listed here, it does
+# not get installed, and the audit fails if the package carries it anyway.
+#
+# Format:  <mode> <path relative to dom0/> [flags]
+#
+#   mode    octal, four digits
+#   path    also the install path, with a leading "/" added
+#   flags   optional, comma-separated:
+#             config   -- %config(noreplace); user may edit, upgrades keep
+#                         their version rather than overwriting it
+#             dir      -- own the directory itself, not a file
+#
+# Nothing here may be setuid, setgid, world-writable, a symlink or a device.
+# vpn-rpm-audit enforces that against the package regardless of what this
+# file says, so a bad edit here cannot quietly widen what ships.
+
+# --- directories this package owns -------------------------------------------
+# /srv/user_salt and /srv/user_pillar are NOT listed: they belong to
+# qubes-mgmt-salt-dom0 and must already exist. Only the vpn/ subtree is ours.
+0755 srv/user_salt/vpn                                  dir
+0755 srv/user_salt/vpn/files                            dir
+
+# --- dom0 commands ------------------------------------------------------------
+0755 usr/local/bin/vpn-build
+0755 usr/local/bin/vpn-build-all
+0755 usr/local/bin/vpn-params-fetch
+0755 usr/local/bin/vpn-endpoints-fetch
+0755 usr/local/bin/vpn-firewall-apply
+0755 usr/local/bin/vpn-salt-sync
+
+# --- qrexec policy ------------------------------------------------------------
+0644 etc/qubes/policy.d/30-vpn.policy
+
+# --- salt entry points --------------------------------------------------------
+# Both are meant to be edited if you run other salt states alongside this one,
+# so an upgrade must not silently revert them.
+0644 srv/user_salt/top.sls                              config
+0644 srv/user_pillar/top.sls                            config
+
+# --- the state tree -----------------------------------------------------------
+0644 srv/user_salt/vpn/init.sls
+0644 srv/user_salt/vpn/dvmtemplate.sls
+0644 srv/user_salt/vpn/dispvm.sls
+0644 srv/user_salt/vpn/vmfiles.sls
+
+# vpn-params.jinja is a template salt renders. The other four run inside the
+# VPN qube and must be executable -- qubes-firewall gates on os.access(X_OK)
+# and skips a non-executable script SILENTLY.
+0644 srv/user_salt/vpn/files/vpn-params.jinja
+0755 srv/user_salt/vpn/files/qubes-firewall-user-script
+0755 srv/user_salt/vpn/files/90-vif-mtu
+0755 srv/user_salt/vpn/files/vpn-up
+0755 srv/user_salt/vpn/files/rc.local
+
+# --- reference ----------------------------------------------------------------
+# Not read by anything; vpn-params-fetch generates the real vpn.sls. Shipped
+# so the pillar directory documents its own format.
+0644 srv/user_pillar/vpn.sls.example

@@ -1,0 +1,179 @@
+#!/bin/sh
+#
+# /rw/config/vpn-up          (mode 0755)
+#
+# Brings up the tunnel at boot. Called from /rw/config/rc.local.
+#
+# Server selection happens HERE, in the qube, not in dom0. In random mode the
+# dom0 firewall has already whitelisted every endpoint in the country, so any
+# choice made here is already covered.
+#
+# If this script fails the qube stays kill-switched: qubes-firewall-user-script
+# has already installed rules 5 and 6, and nothing reaches eth0 without a
+# tunnel.
+
+set -eu
+
+. /rw/config/vpn-params
+
+CONF_DIR=/rw/config/vpn
+INCOMING=/home/user/QubesIncoming
+MAP="$CONF_DIR/endpoint-map.txt"
+AUTH="$CONF_DIR/auth-user-pass.txt"
+
+log() { logger -t vpn-up "$*"; }
+
+mkdir -p "$CONF_DIR"
+chmod 700 "$CONF_DIR"
+
+# dom0 normally moves the pushed files into $CONF_DIR in the dvm template right
+# after the copy (vpn-build step 7), so nothing is left sitting in the
+# template's home directory. This is the fallback for a config placed by hand.
+if [ -d "$INCOMING" ]; then
+    find "$INCOMING" -type f \
+        \( -name '*.conf' -o -name 'endpoint-map.txt' -o -name 'auth-user-pass.txt' \) \
+        -exec mv -t "$CONF_DIR" {} + 2>/dev/null || true
+    rm -rf "$INCOMING" 2>/dev/null || true
+fi
+chmod 600 "$CONF_DIR"/*.conf 2>/dev/null || true
+# Account credentials in cleartext, same as the configs. OpenVPN refuses a
+# world-readable auth file on some builds and it should not be readable anyway.
+[ -f "$AUTH" ] && chmod 600 "$AUTH" 2>/dev/null || true
+
+set -- "$CONF_DIR"/*.conf
+[ -e "$1" ] || { log "no configs in $CONF_DIR"; exit 1; }
+
+if [ "$MODE" = "random" ]; then
+    # Pick by index rather than parsing ls output, so a newline in a filename
+    # cannot split one name into two.
+    conf_i=$(shuf -i "1-$#" -n 1)
+    eval "conf=\${$conf_i}"
+else
+    conf=$1
+fi
+base=$(basename "$conf")
+log "selected $base"
+
+# The IP:PORT dom0 whitelisted for this config. Taken from the map rather than
+# from the config body, so the tunnel can only be aimed at an address the
+# firewall already allows.
+endpoint=""
+if [ -f "$MAP" ]; then
+    endpoint=$(awk -v f="$base" '$1 == f { print $2; exit }' "$MAP")
+fi
+
+case "$PROTOCOL" in
+  wireguard)
+    # The interface is named after the config FILENAME, and the kernel caps
+    # interface names at 15 chars -- "uk123.nordvpn.com" is 17 and fails
+    # outright. So it is always installed under the fixed name below.
+    mkdir -p /etc/wireguard
+    install -m 600 /dev/null /etc/wireguard/wireguard.conf
+    # Inject MTU into [Interface] if the config does not set one.
+    if grep -qi '^[[:space:]]*MTU[[:space:]]*=' "$conf"; then
+        cat "$conf" > /etc/wireguard/wireguard.conf
+    else
+        awk -v mtu="$MTU" '
+            { print }
+            /^[[:space:]]*\[Interface\][[:space:]]*$/ { print "MTU = " mtu }
+        ' "$conf" > /etc/wireguard/wireguard.conf
+    fi
+
+    # If the config aims somewhere dom0 did not whitelist, the handshake is
+    # simply dropped and the tunnel hangs with no explanation. Say so instead.
+    if [ -n "$endpoint" ]; then
+        cfg_ep=$(awk -F= '
+            /^[[:space:]]*[Ee]ndpoint[[:space:]]*=/ {
+                gsub(/[[:space:]]/, "", $2); print $2; exit
+            }' "$conf")
+        [ "$cfg_ep" = "$endpoint" ] || log \
+            "WARNING: config endpoint '$cfg_ep' is not the whitelisted '$endpoint' - the firewall will block it"
+    fi
+
+    wg-quick up wireguard
+    ;;
+
+  openvpn)
+    # DNS is dropped by the dom0 firewall (drop specialtarget=dns), so a
+    # hostname in "remote" can never resolve. The endpoint map is what makes
+    # OpenVPN usable at all here; without it, fail loudly rather than hang.
+    [ -n "$endpoint" ] || {
+        log "no endpoint-map entry for $base - DNS is blocked, so a hostname remote cannot resolve"
+        exit 1
+    }
+    ovpn_host=${endpoint%:*}
+    ovpn_port=${endpoint##*:}
+
+    if [ "${TRANSPORT:-udp}" = "tcp" ]; then ovpn_proto="tcp-client"; else ovpn_proto="udp"; fi
+
+    mkdir -p /etc/openvpn/client
+    # 0600 before writing: an OpenVPN config routinely carries inline <key>
+    # blocks or auth-user-pass credentials. A bare "cat >" leaves it 0644.
+    install -m 600 /dev/null /etc/openvpn/client/vpn.conf
+
+    # An OpenVPN config that needs account credentials ships "auth-user-pass"
+    # with no filename, which means "prompt on the terminal". Under systemd
+    # there is no terminal, so the unit fails at startup with nothing useful in
+    # the log. Fail here instead, with the fix.
+    # Matches the directive whether or not it names a file: a config that
+    # points at its own credentials file is equally broken here, because only
+    # auth-user-pass.txt is ever shipped alongside the configs.
+    if [ ! -f "$AUTH" ] \
+       && grep -qiE '^[[:space:]]*auth-user-pass([[:space:]]|$)' "$conf"; then
+        log "$base needs account credentials but $AUTH is missing"
+        log "put them in vpn-config-files-vm:/home/user/configs/auth-user-pass.txt"
+        log "(line 1 username, line 2 password), then re-run vpn-build"
+        exit 1
+    fi
+
+    # Strip every directive we are about to set, then set it. "remote-cert-tls"
+    # and similar survive: the keyword must be followed by whitespace or end of
+    # line, and "remote-" is neither.
+    grep -v -iE '^[[:space:]]*(remote|proto|dev|dev-type|tun-mtu|auth-user-pass)([[:space:]]|$)' "$conf" \
+        > /etc/openvpn/client/vpn.conf || true
+    {
+        printf 'remote %s %s\n' "$ovpn_host" "$ovpn_port"
+        printf 'proto %s\n'     "$ovpn_proto"
+        # Pin the device name so it is never a guess about tun numbering, and
+        # so it always matches what the firewall script was told to expect.
+        printf 'dev-type tun\ndev %s\n' "$VPN_IF"
+        printf 'tun-mtu %s\n'   "$MTU"
+        # Point the directive at a file, so nothing is ever prompted for.
+        # Trailing "true": this is the last command in the group, and under
+        # "set -e" a false test here would abort the script.
+        if [ -f "$AUTH" ]; then printf 'auth-user-pass %s\n' "$AUTH"; fi
+        true
+    } >> /etc/openvpn/client/vpn.conf
+
+    systemctl start openvpn-client@vpn
+    ;;
+
+  *)
+    log "unknown PROTOCOL '$PROTOCOL'"
+    exit 1
+    ;;
+esac
+
+# wg-quick creates the interface synchronously, but "systemctl start" returns
+# as soon as the unit is started, not when the tunnel is actually up. Wait for
+# the interface before re-applying the firewall, or its detection runs against
+# a state that does not exist yet and the qube stays kill-switched for good.
+waited=0
+while [ "$waited" -lt 30 ]; do
+    [ -e "/sys/class/net/$VPN_IF" ] && break
+    sleep 1
+    waited=$((waited + 1))
+done
+
+if [ ! -e "/sys/class/net/$VPN_IF" ]; then
+    log "tunnel interface $VPN_IF never appeared after ${waited}s - qube stays kill-switched"
+    /rw/config/qubes-firewall-user-script || true
+    exit 1
+fi
+
+# Re-run the firewall script now that the tunnel is real, so its detection and
+# its log line reflect reality.
+/rw/config/qubes-firewall-user-script || log "firewall script returned non-zero"
+
+log "tunnel up on $VPN_IF"
+exit 0

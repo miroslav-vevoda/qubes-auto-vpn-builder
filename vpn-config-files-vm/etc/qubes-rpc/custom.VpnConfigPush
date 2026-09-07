@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# /etc/qubes-rpc/custom.VpnConfigPush       (in vpn-config-files-vm, mode 0755)
+#
+# stdin: "<target-qube> <country> <selector|ALL>"
+#
+# Copies config files to the target with qvm-copy-to-vm. The target must carry
+# the vpn-endpoint tag or the qubes.Filecopy policy refuses -- so even if this
+# service were tricked into naming a different qube, the transfer fails.
+#
+# Key material goes qube-to-qube and never lands on dom0's filesystem.
+
+set -eu
+
+read -r target country sel || exit 1
+
+case "$target"  in ""|*[!a-zA-Z0-9_-]*) echo "invalid target" >&2;   exit 1 ;; esac
+case "$country" in [a-z][a-z]) ;;       *) echo "invalid country" >&2; exit 1 ;; esac
+
+dir="/home/user/configs/$country"
+[ -d "$dir" ] || { echo "no such country" >&2; exit 1; }
+
+if [ "$sel" = "ALL" ]; then
+    set -- "$dir"/*.conf
+else
+    case "$sel" in ""|*[!a-z0-9]*) echo "invalid selector" >&2; exit 1 ;; esac
+    set -- "$dir/$sel".*.conf
+fi
+[ -e "$1" ] || { echo "no configs matched" >&2; exit 1; }
+
+# The endpoint map travels with the configs. It is metadata only -- the same
+# lines this qube already hands to dom0 via custom.VpnEndpointList. The VPN
+# qube needs it because DNS is dropped there by the dom0 firewall, so it has
+# to resolve its chosen config to a whitelisted IP locally rather than by name.
+if [ -f "$dir/endpoint-map.txt" ]; then
+    set -- "$@" "$dir/endpoint-map.txt"
+fi
+
+# OpenVPN account credentials, if the provider requires them. Account-wide
+# rather than per-country, so it sits one level up beside the country folders.
+#
+# This is key material and lives HERE, with the configs, for the same reason
+# they do: it travels qube-to-qube over qubes.Filecopy and never lands on
+# dom0's filesystem. Routing it through salt-configs-vm instead would put it in
+# dom0's pillar on the way -- readable in /srv/user_pillar, and in a qube whose
+# entire premise is that it holds no secrets.
+if [ -f "/home/user/configs/auth-user-pass.txt" ]; then
+    set -- "$@" "/home/user/configs/auth-user-pass.txt"
+fi
+
+exec qvm-copy-to-vm "$target" "$@"
