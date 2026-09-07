@@ -12,7 +12,8 @@ projects.
 **Contents**
 
 - [What this is for](#what-this-is-for)
-- [The three qubes, and why they are separate](#the-three-qubes-and-why-they-are-separate) — read this first
+- [What you get](#what-you-get) — speed, consistency, kill switch, chaining
+- [The qubes involved](#the-qubes-involved)
 - [Using it](#using-it) — the four steps, briefly
 - [Step 1 in detail: preparing your provider's configs](#step-1-in-detail-preparing-your-providers-configs) — the endpoint map
 - [What happens when you run the build](#what-happens-when-you-run-the-build)
@@ -44,66 +45,79 @@ That's the whole point: making a correctly-configured VPN qube something you
 generate on demand instead of something you hand-build and are then
 reluctant to touch again.
 
-## The three qubes, and why they are separate
+## What you get
 
-Almost every design decision here follows from one split, so it is worth
-understanding before anything else.
+**Speed.** Switching country or server is one line in a text file and one
+command. No qube to create, no package to install, no rules to write, no
+config to copy. Building a second, third or fourth VPN qube costs the same
+one command each — the manual route costs the whole procedure again, every
+time.
+
+**Consistency.** Every qube is built from the same salt states and the same
+validated parameters, so they come out identical apart from the values you
+chose. There is no "I think I set the MTU on that one" — the MTU, the
+firewall ruleset, the file modes, the tunnel bring-up and the kill switch are
+the same on qube five as on qube one. Hand-built VPN qubes drift; generated
+ones cannot.
+
+**Disposability.** The qube you use is a *named disposable*. Its root
+filesystem is discarded and rebuilt every boot, so nothing accumulates in it
+and nothing you do inside it persists. Rebuilding from scratch is a restart,
+not a project. The tunnel comes up fresh each time from the config, which
+means a broken state is fixed by turning it off and on again — genuinely, not
+as a joke.
+
+**A kill switch that fails closed.** If the tunnel drops, downstream traffic
+stops rather than falling back to your clear connection. This is the part
+hand-rolled setups most often get wrong, because the obvious firewall rule
+(`ct state established,related accept`) is exactly the rule that leaks. Two
+independent layers enforce it — see [The two firewalls](#the-two-firewalls).
+
+**Chaining.** Point one VPN qube at another as its uplink and traffic goes
+through both tunnels. `vpn-build-all` builds a whole set in order and checks
+the things you cannot check one file at a time: name collisions, uplink
+ordering, and whether each hop's MTU actually fits inside its parent's. Get
+that last one wrong by hand and you get a tunnel where `ping` works and
+anything large silently vanishes.
+
+**Nothing is guessed.** Every value is validated against a strict pattern
+before use, and anything that doesn't match aborts the build instead of
+proceeding on a default. A misspelt country code fails loudly at the start
+rather than producing a qube that doesn't work for reasons you get to
+discover later.
+
+## The qubes involved
+
+Four things, and knowing which is which makes the rest of this document easier
+to follow:
 
 | Qube | Holds | Network |
 |---|---|---|
 | **dom0** | the build commands and the salt states | none, as always |
 | **`salt-configs-vm`** | the settings file you edit, and an authoring copy of the salt states | normal |
-| **`vpn-config-files-vm`** | your provider's configs, **including private keys** | **`netvm = none`** |
-| *(generated)* `<provider>-<sel>-vpn-dvm` + `-vpn` | the template and the disposable you actually use | template: none; disposable: whatever you set `uplink=` to |
+| **`vpn-config-files-vm`** | your provider's configs and keys | `netvm = none` |
+| *(generated)* `<provider>-<sel>-vpn-dvm` | the DVM template — created for you | none |
+| *(generated)* `<provider>-<sel>-vpn` | the disposable you actually use | whatever you set `uplink=` to |
 
-Three consequences, each of which explains a chunk of the rest of this
-document:
+The practical reasons for the split: your provider's configs sit in an offline
+qube, so you can't accidentally break them and nothing in there can phone
+home; the settings file you edit weekly is somewhere separate from your keys;
+and the build reads the two independently, which is why a bad settings file
+can never damage your config collection.
 
-### What the split is not
+Two consequences you will actually run into:
 
-**It is not protection from dom0.** dom0 is the most privileged thing on the
-machine and can read anything in any qube — one `qvm-run --pass-io
-vpn-config-files-vm 'cat …'` and it has your private keys. `netvm = none`
-constrains the *network*, not dom0. Nothing here changes that, and no design
-on Qubes can.
+- **`vpn-config-files-vm` has no DNS**, which is why the endpoint map has to
+  be built beforehand in a networked qube — see the next section.
+- **The generated template has no network** and never runs. Only the
+  disposable does. Firewall rules on the template do nothing, which is why
+  `vpn-firewall-apply` targets the disposable.
 
-So the split is not a claim that your keys are safe from the automation. It is
-a set of defences against everything that *isn't* dom0:
-
-**A compromised config qube cannot exfiltrate.** `vpn-config-files-vm` has
-`netvm = none`, so even if something in it is malicious — a tampered config, a
-bad download — it has no route out. This is also why the endpoint map must be
-built *before* the configs land there: that qube has no DNS, ever.
-
-**Another qube cannot ask for your keys.** The qrexec policy in
-`30-vpn.policy` scopes the copy by a **tag that only dom0 can set**, so
-`vpn-config-files-vm` will only ever send files to the qube dom0 just tagged.
-A second compromised qube cannot request them, and cannot name itself as the
-destination.
-
-**The keys are not in dom0's filesystem.** dom0 *could* read them, but as
-built it never stores or relays them — it triggers a direct qube-to-qube
-transfer. That keeps them out of dom0's disk, logs and swap, which reduces
-accidental exposure rather than adversarial exposure. A real but modest
-benefit, and worth stating as the modest thing it is.
-
-**The file you edit is not where your secrets are.** Choosing a country is
-routine and frequent; handling private keys is not. Separating them means the
-thing you touch weekly is not the thing that would hurt you to lose.
-
-### The actual threat model
-
-The concern is **dom0 being compromised**, not secrecy. Since dom0 can already
-read every secret on the machine, protecting secrets *from* it is not a goal
-worth pursuing — the goal is to minimise what flows *into* it, because that is
-the only direction that can make dom0 worse than it already is.
-
-That is what the rest of this design is about, and it is why the security
-effort is concentrated somewhere that looks unrelated: the only code that ever
-crosses into dom0 does so as a signed package whose structure has been audited
-in a disposable build qube (`tools/rpm/vpn-rpm-audit`), and the only thing
-crossing per build is a dozen `key=value` lines parsed against a fixed
-whitelist.
+The trust boundaries — what each qube can and cannot reach, what dom0 can see,
+and where the design deliberately stops trying — are set out in
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §2. Short version: this is not, and
+cannot be, protection *from* dom0; dom0 can read anything on the machine. The
+security effort goes into limiting what flows *into* dom0 instead.
 
 ## Using it
 
@@ -337,24 +351,18 @@ which none of the three above has. `tools/rpm/` runs in the build qube, and
    password on two lines in `/home/user/configs/auth-user-pass.txt` — without
    it the tunnel cannot authenticate. See `configs/README.txt`.
 4. **Install the dom0 half as a signed package.** In a dedicated offline build
-   qube: `tools/rpm/build-rpm.sh --sign <KEYID>`, which generates the spec
-   from `tools/rpm/manifest.txt`, builds, signs, and then runs
-   `tools/rpm/vpn-rpm-audit` against its own output — deleting the package if
-   any check fails. Then, in dom0, pull the one `.rpm`, `rpmkeys -Kv` it, and
-   `sudo rpm -Uvh`.
+   qube: `tools/rpm/build-rpm.sh --sign <KEYID>`, which builds, signs, and
+   audits its own output, deleting the package if any check fails. Then in
+   dom0: pull the `.rpm`, `rpmkeys -Kv` it, `sudo rpm -Uvh`.
 
-   Full procedure, including generating the key and getting its fingerprint
-   into dom0 safely, is in
+   You only do this once — the state tree does not change per build, and
+   everything build-specific reaches it as pillar data. Upgrades are
+   `rpm -Uvh` again, and `rpm -V qubes-vpn-dvm-dom0` tells you whether what is
+   in dom0 is still what you installed.
+
+   Full procedure — generating the key, getting its fingerprint into dom0,
+   what the audit checks and why signing alone is not enough — is in
    [`docs/getting-files-into-dom0.md`](docs/getting-files-into-dom0.md).
-
-   This is the only time code crosses into dom0. Note what the signature does
-   and does not do: it proves the package left the build VM unmodified. It
-   does **not** make the contents safe — a signed backdoor installs perfectly
-   — so `vpn-rpm-audit` checks the package (no install-time scriptlets, no
-   symlinks or setuid, nothing outside the manifest, every digest matching the
-   reviewed source), and reading the source is still on you. What signing buys
-   is that all of that checking happens in a disposable qube instead of in
-   dom0.
 5. **In dom0:** `vpn-build` — creates everything. For a set of numbered
    configs instead, `vpn-build-all -n` to validate and then `vpn-build-all`
    to build (see **Building several qubes**).
@@ -480,33 +488,30 @@ enabled the kill switch already covers it.
 7  (bare)                          drop     catch-all
 ```
 
-`iifgroup 2` means "arrived from a qube using this one as its netvm". Four
-design points, each of which is load-bearing:
+`iifgroup 2` means "arrived from a qube using this one as its netvm".
 
-- **Every `accept` names the tunnel interface.** When the tunnel is down there
-  is no state in which an accept can match, so the chain degrades to
-  kill-switch-only rather than failing open.
-- **Rule 3 is scoped on purpose.** A bare `ct state established,related
-  accept` would also match a flow established *through* the tunnel that is now
-  routing out `eth0` because the tunnel dropped — and `accept` is terminal, so
-  it would never reach rules 5 and 6. That is precisely the leak this exists
-  to stop. Scoping cannot break connectivity: the Qubes base forward chain
-  carries its own unscoped established/related accept *after* the jump, so a
-  legitimate packet this rule misses still gets through, while a leaked one
-  hits a drop first.
-- **Rule 7 exists because 5 and 6 name `eth0`.** Traffic leaving by any other
-  interface would fall through to the base forward chain, which is `policy
-  accept`. A second uplink — an attached NIC, a USB tether — would otherwise
-  leak everything, silently.
-- **Each family loads as one `nft -f` transaction.** Adding rules one at a
-  time leaves the chain empty between the flush and the final add, and with a
-  `policy accept` base chain that window is a real leak on *every* firewall
-  reload. A transaction also means a rejected rule leaves the previous ruleset
-  intact instead of a half-built one.
+What this buys you in practice:
 
-If the ruleset fails to load, the script flushes the chain and forces a bare
-`oifname eth0 drop`. An empty chain would mean `policy accept`, so the failure
-mode is closed, not open.
+- **The tunnel dropping is not a leak.** Every `accept` names the tunnel
+  interface, so when it is gone there is no state in which an accept can
+  match. The chain degrades to kill-switch-only instead of failing open.
+- **A second uplink is not a leak either.** Rules 5 and 6 name `eth0`, so rule
+  7 catches anything leaving by a different interface — an attached NIC, a USB
+  tether — which would otherwise slip past into a `policy accept` base chain.
+- **Reloading the firewall is not a leak.** Each address family loads as one
+  `nft -f` transaction, so there is no window where the chain sits empty.
+- **A failed load is not a leak.** If the ruleset won't load, the script
+  forces a bare `oifname eth0 drop` rather than leaving an empty chain.
+- **IPv6 is covered whether you use it or not**, so enabling it later cannot
+  quietly open a hole.
+
+Rule 3 is the subtle one, and it is where hand-written versions of this
+usually go wrong: it is scoped to the tunnel interface rather than being a
+bare `ct state established,related accept`, because the bare form also matches
+flows established *through* the tunnel that are now routing out `eth0` — and
+`accept` is terminal, so those never reach the drops below.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §4 works through why each rule is shaped
+the way it is, and why scoping it cannot break legitimate return traffic.
 
 ### Layer 2 — `qvm-firewall`, on the *named disposable*
 
@@ -596,75 +601,18 @@ Checked against a running qube (`qubes-core-agent-4.3.47`, Fedora 43) — see
   `custom-forward` first — which is why rule order in that chain, and
   applying it as one atomic `nft -f` transaction, are both security-relevant
 
-### Why there is a hostile package at all
+**The packaging tools** (rpm 6.0.2, Fedora 43, 2026-09-07). `build-rpm.sh`
+runs clean end to end: signed with a matching key it passes all 31 assertions
+and keeps the package; unsigned, or signed by the wrong key, it fails and
+deletes the package. `vpn-rpm-audit` raises 14 failures against the
+deliberately hostile test package in `tools/rpm/selftest-hostile.spec`,
+catching every planted trait.
 
-`tools/rpm/selftest-hostile.spec` is a deliberately malicious package that
-exists to be rejected. Three reasons it is in the repo rather than something
-run once and thrown away:
-
-**An audit script that passes everything looks exactly like one that works.**
-Feeding a checker good input tells you nothing — it returns PASS whether it is
-sound or whether it is a stub. The only way to learn that a refusal actually
-fires is to hand it something you *know* is bad and watch it refuse. Every
-green run of `build-rpm.sh` is evidence only if the red run has been seen too.
-
-**Nothing else in the toolchain will stop you.** `rpmbuild` builds a package
-carrying a root cron job, a setuid binary, a symlink to `/etc/shadow`, an
-`Obsoletes:` on `qubes-core-dom0` and a scriptlet that runs as root in dom0 —
-and exits **0**. Its sole objection is one `warning: absolute symlink` line,
-easily lost in build output. rpm is a packaging tool, not a security boundary,
-and it does not pretend otherwise. If the check does not happen here, it does
-not happen.
-
-**It is what makes the signature mean something.** Signing proves origin, not
-safety — a signed backdoor installs perfectly. The signature is only worth
-trusting because the build qube refuses to sign anything that fails the audit,
-so the audit's soundness is the load-bearing part. Testing it is testing the
-one thing the whole dom0 install path rests on.
-
-The fixture's header documents which check should catch which trait. If one of
-them ever *passes*, that check is broken.
-
-**Result — `vpn-rpm-audit` against the hostile package** (rpm 6.0.2, Fedora
-43, 2026-09-07). `rpmbuild` built it and exited 0; the audit raised 14 FAIL
-lines and exited 1, catching every planted trait:
-
-- the `%post` scriptlet, the `Obsoletes: qubes-core-dom0`, the `Conflicts:`
-- the setuid file, the world-writable file, the non-root owner
-- the symlink to `/etc/shadow` — twice, once from header metadata (check 6)
-  and again from the unpacked payload (check 9)
-- the `%ghost`, the `/etc/cron.d` path, the compressed payload, and every
-  manifest and source-tree mismatch
-
-Two of the fourteen were not predicted when the fixture was written: rpm
-injects a `/bin/sh` dependency whenever a scriptlet exists — *even under
-`AutoReqProv: no`* — so check 4 catches install-time code independently of
-check 3. Reproduce it with the commands in `selftest-hostile.spec`.
-
-**`build-rpm.sh`, end to end** (same host and date). Three runs: unsigned
-fails only check 2 and the package is deleted, exit 1; signed with a matching
-key passes all 31 assertions and the package is kept, exit 0; signed with a
-non-matching key fails check 2 and is deleted. Short key ids, `0x` prefixes
-and spaced gpg fingerprints all match correctly.
-
-Getting there took fixing two real bugs, both worth knowing about:
-
-- **`brp-mangle-shebangs` rewrote the payload.** Fedora's rpmbuild runs
-  policy scripts over the buildroot after `%install`; one of them rewrites
-  `#!/bin/bash` to `#!/usr/bin/bash` in every file with the execute bit. The
-  package therefore shipped bytes that were *not* the reviewed bytes —
-  harmless in effect, fatal to the guarantee. Check 8 caught it, failing on
-  exactly the ten 0755 files and no others. Fixed by setting
-  `%global __os_install_post %{nil}` in the generated spec.
-- **The `--key` check could never pass on rpm 6.** rpm 4/5 print
-  `key ID <16 hex>`; rpm 6 prints `key fingerprint: <40 hex>`. The audit
-  matched only the older wording, so a correctly signed package was reported
-  as signed by "a different key: " — with nothing after the colon. A false
-  failure in a security tool is worse than no check, because the sane
-  response is to stop believing it. Now accepts either wording, and fails
-  loudly if it can parse no key id at all rather than passing silently.
-
-Neither would have been found by reading the scripts.
+Testing that turned up two bugs that reading the code had not — rpmbuild
+silently rewriting shebangs in the payload, and the signing-key check being
+impossible to pass on rpm 6. Both fixed; the detail, and why the hostile
+package is in the repo at all, is in
+[`docs/getting-files-into-dom0.md`](docs/getting-files-into-dom0.md).
 
 **Not checked** — dom0 was not accessible from the authoring qube:
 
@@ -681,10 +629,10 @@ Neither would have been found by reading the scripts.
 - **OpenVPN mode end to end.** The WireGuard path is the one the design was
   built around; the OpenVPN path (remote rewrite from the endpoint map,
   `dev` pinning, `tcp` transport) is reasoned-through but has not been run.
-- **Installing the package in dom0.** The build and audit are proven (see
-  *Verified* above), but no package has been transferred to dom0 or installed
-  there. `rpm -Uvh`, the `.rpmnew` behaviour on upgrade, and `rpm -V` drift
-  reporting are all reasoned-through and unexercised.
+- **Installing the package in dom0.** Building and auditing it is proven, but
+  no package has been transferred to dom0 or installed there. `rpm -Uvh`, the
+  `.rpmnew` behaviour on upgrade, and `rpm -V` drift reporting are all
+  reasoned-through and unexercised.
 - **Chained VPN qubes end to end.** `vpn-build-all`'s own logic is tested
   (validation, ordering, MTU descent, failure handling — against stubbed
   `qvm-*` commands), but no chain has actually been brought up. Two things

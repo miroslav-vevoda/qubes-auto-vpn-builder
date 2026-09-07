@@ -129,11 +129,36 @@ raises 14 FAIL lines and exits 1 on the hostile package; `build-rpm.sh` passes
 all 31 assertions when signed with a matching key, and deletes the package
 when unsigned or signed by the wrong one.
 
-That testing found two bugs that reading the code had not, both now fixed —
-rpmbuild silently rewriting shebangs in the payload, and the `--key` check
-being impossible to pass on rpm 6. Details in `README.md` under *Status:
-verified vs. assumed*. The lesson generalises: run it on **your** machine
-against **your** rpm version, because both bugs were version-specific.
+That testing found two bugs that reading the code had not. Both are fixed, and
+both are worth knowing about because they show what this kind of testing
+actually catches:
+
+- **`brp-mangle-shebangs` was rewriting the payload.** Fedora's rpmbuild runs
+  policy scripts over the buildroot after `%install`; one of them rewrites
+  `#!/bin/bash` to `#!/usr/bin/bash` in every file carrying the execute bit.
+  The package therefore shipped bytes that were *not* the reviewed bytes —
+  harmless in effect, since `/bin` is a symlink to `/usr/bin`, but fatal to
+  the guarantee the whole install path rests on. Check 8 caught it, failing on
+  exactly the ten 0755 files and no others. Fixed with
+  `%global __os_install_post %{nil}` in the generated spec.
+- **The `--key` check could never pass on rpm 6.** rpm 4/5 print
+  `key ID <16 hex>`; rpm 6 prints `key fingerprint: <40 hex>`. The audit
+  matched only the older wording, so a correctly signed package was rejected
+  as signed by *"a different key: "* — with nothing after the colon. A false
+  failure in a security tool is worse than no check at all, because the
+  reasonable response to it is to stop believing the tool. It now accepts
+  either wording, matches a short id as a suffix of the fingerprint, and
+  **fails loudly** if it can parse no key id rather than passing silently.
+
+**Both bugs were version-specific**, which is the argument for running this
+yourself rather than trusting the result above: your rpm may differ from the
+one this was tested against, in exactly the way that produced these two.
+
+And one reason the fixture stays in the repo rather than being run once and
+deleted: the signature is only worth trusting because the build refuses to
+sign anything that fails the audit. That makes the audit's soundness the
+load-bearing part of the entire dom0 install path — so it is the one thing
+worth re-testing whenever the toolchain underneath it changes.
 
 `tools/rpm/selftest-hostile.spec` builds a package carrying one instance of
 each thing `vpn-rpm-audit` is supposed to refuse: a `%post` scriptlet, a
