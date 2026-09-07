@@ -5,9 +5,10 @@ single config choice — protocol, MTU, and a country or specific server — wit
 your VPN provider's key material kept in a qube the automation itself never
 has to touch.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design rationale, the bugs
-in the original concept it fixes, and external validation against Qubes docs
-and community projects.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the design rationale: the trust
+boundaries between the qubes, both firewall layers in full, the build-time and
+boot-time data flow, and external validation against Qubes docs and community
+projects.
 
 **Contents**
 
@@ -278,7 +279,6 @@ tools/                                   run outside dom0, nothing installed
 
 docs/                                    documentation only, nothing installed
   getting-files-into-dom0.md             building, signing and installing the package
-  original-concept.md                    the first draft, kept for reference
 ```
 
 Each top-level directory except `tools/` and `docs/` is named after the qube
