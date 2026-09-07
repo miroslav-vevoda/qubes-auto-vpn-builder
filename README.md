@@ -107,8 +107,9 @@ can never damage your config collection.
 
 Two consequences you will actually run into:
 
-- **`vpn-config-files-vm` has no DNS**, which is why the endpoint map has to
-  be built beforehand in a networked qube — see the next section.
+- **`vpn-config-files-vm` has no network at all** (`netvm = none`), which is
+  why the endpoint map has to be built beforehand in a networked qube — see
+  the next section.
 - **The generated template has no network** and never runs. Only the
   disposable does. Firewall rules on the template do nothing, which is why
   `vpn-firewall-apply` targets the disposable.
@@ -171,13 +172,15 @@ copying anything into `vpn-config-files-vm`.**
 
 ### Why this is a separate step
 
-Because it needs DNS, and this is the only moment in the entire workflow that
-has any:
+Because it needs to resolve hostnames, and this is the only moment in the
+entire workflow that can. Three different reasons:
 
-- `vpn-config-files-vm` has `netvm = none`
-- dom0 has no network at all
-- the VPN qube has DNS **dropped** by the `qvm-firewall` rules dom0 applies to
-  it (layer 1 under [The two firewalls](#the-two-firewalls))
+- **`vpn-config-files-vm` has `netvm = none`** — no network at all, so
+  nothing to resolve *with*
+- **dom0 has no network** either
+- **the VPN qube has network but DNS specifically dropped**, by the
+  `qvm-firewall` rules dom0 applies to it (Layer 2 under
+  [The two firewalls](#the-two-firewalls))
 
 Your provider's configs usually name servers by hostname
 (`Endpoint = uk123.mullvad.net:51820`). But the firewall that locks the VPN
@@ -340,7 +343,8 @@ which none of the three above has. `tools/rpm/` runs in the build qube, and
 2. **In the networked qube where you downloaded your configs:** arrange them
    one folder per country code and run `tools/build-endpoint-map.sh ~/configs`.
    This resolves any hostnames and writes `endpoint-map.txt` into each folder.
-   It has to happen here — it's the only step in the whole workflow with DNS.
+   It has to happen here — it's the only step in the whole workflow that can
+   resolve a hostname at all.
    Full explanation in **Step 1 in detail**, above; read it before you run
    this, particularly if you use WireGuard with hostname endpoints.
 3. **In `vpn-config-files-vm`:** copy `etc/qubes-rpc/*` to `/etc/qubes-rpc/`
