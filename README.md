@@ -23,6 +23,7 @@ and community projects.
 - [The two firewalls](#the-two-firewalls) — how the kill switch works
 - [Verify after build](#verify-after-build)
 - [Status: verified vs. assumed](#status-verified-vs-assumed) — what is actually tested
+- [Support](#support)
 
 ---
 
@@ -644,3 +645,34 @@ Neither would have been found by reading the scripts.
   to watch when you first try it: whether your provider allows reaching one
   of its endpoints from inside another of its tunnels, and whether the real
   per-hop overhead matches the conservative figures above.
+
+## Support
+
+If this saved you an afternoon, a tip is welcome. Entirely optional — the
+project is GPLv2 and stays that way either way.
+
+**Bitcoin**
+
+```
+bc1qzv427sr20hvp3kuau32ctl8hp89krer5qcdgrj
+```
+
+**Monero**
+
+```
+455UkB9UWDPgJUxoUsLwqvMK6yh6k2sJ1PSU6spFbYT9h5ehwvEdcM5iHKBV5gwD3CBbovfPtUYMhWWUXcaLTyw45ifym6q
+```
+
+**Ethereum / EVM tokens**
+
+```
+0x1875Eb325f5a97009e24E9B4567f2f9A8d6F9A7e
+```
+
+> **Check before you send.** Addresses in a public README are a standing
+> target for tampering — a swapped address in a pull request or a commit is a
+> well-known way to redirect donations, and it is invisible unless someone
+> looks. All three above carry their own checksums (bech32, EIP-55, and
+> Monero's keccak checksum), so a wallet will reject a corrupted one, but a
+> *substituted* valid address checks out fine. Compare against
+> `git log -p -- README.md` if you want to see when they last changed.
