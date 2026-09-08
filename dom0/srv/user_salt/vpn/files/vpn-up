@@ -54,6 +54,13 @@ fi
 base=$(basename "$conf")
 log "selected $base"
 
+# Record the choice for vpn-statusd, which puts it in the terminal banner.
+# /run is tmpfs, so it never persists into a fresh disposable. vpn-statusd
+# scrubs this before printing it -- the name comes out of the provider's
+# download and is the one untrusted string in the status output.
+printf '%s\n' "$base" > /run/vpn-selected 2>/dev/null || true
+chmod 0644 /run/vpn-selected 2>/dev/null || true
+
 # The IP:PORT dom0 whitelisted for this config. Taken from the map rather than
 # from the config body, so the tunnel can only be aimed at an address the
 # firewall already allows.

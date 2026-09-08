@@ -1,4 +1,30 @@
 #!/bin/sh
 # /rw/config/rc.local          (mode 0755)
+
+# Terminal status banner. /etc is on the root volume, which is re-copied from
+# the base template at every boot, so the master copy lives on the private
+# volume and is installed into place here. Done FIRST and unconditionally: if
+# vpn-up fails below, the banner is precisely the thing you want working.
+if [ -r /rw/config/vpn-status.sh ]; then
+    install -m 0644 -o root -g root \
+        /rw/config/vpn-status.sh /etc/profile.d/vpn-status.sh \
+        || logger -t vpn-status "failed to install /etc/profile.d/vpn-status.sh"
+fi
+
+# Root-side status poller. systemd-run rather than "&" because the unit that
+# runs this script -- qubes-misc-post.service -- is Type=oneshot, so a plain
+# background child sits in a cgroup systemd is entitled to reap. A transient
+# unit survives, restarts if it dies, is killed cleanly at shutdown, and can
+# be inspected with "systemctl status vpn-statusd".
+if [ -x /rw/config/vpn-statusd ]; then
+    systemd-run --unit=vpn-statusd \
+        --description="VPN tunnel status poller" \
+        --property=Restart=always \
+        --property=RestartSec=5 \
+        --collect \
+        /rw/config/vpn-statusd >/dev/null 2>&1 \
+        || logger -t vpn-status "failed to start vpn-statusd"
+fi
+
 /rw/config/vpn-up || logger -t vpn-up "vpn-up failed - qube stays killswitched"
 exit 0

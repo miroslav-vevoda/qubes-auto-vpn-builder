@@ -1,0 +1,218 @@
+#!/bin/sh
+#
+# /rw/config/vpn-statusd          (mode 0755)
+#
+# Root-side tunnel status poller. Writes /run/vpn-status every $INTERVAL
+# seconds. Everything that wants to know whether the tunnel is alive reads
+# that file instead of checking for itself -- the terminal banner, the shell
+# prompt marker, and anything added later (a notification, a tray icon).
+# None of those need root, and none of them need to know how the check works.
+#
+# It has to run as root because the two facts most worth knowing are both
+# privileged:
+#
+#   * Whether a WireGuard tunnel is actually ALIVE. WireGuard has no
+#     connection state. wg-quick creates the interface and it stays there
+#     forever whether or not the peer ever answers a single packet, so
+#     "does /sys/class/net/wireguard exist" reports green on a stone dead
+#     tunnel. The only real signal is the last handshake time, and reading it
+#     needs CAP_NET_ADMIN.
+#   * Whether the kill switch is actually loaded. Reading the nftables
+#     ruleset needs root.
+#
+# Started by /rw/config/rc.local through systemd-run, so it is a real unit
+# rather than a stray background process:
+#
+#     systemctl status vpn-statusd
+#     journalctl -u vpn-statusd
+#
+# That matters because qubes-misc-post.service -- which runs rc.local -- is
+# Type=oneshot. A plain "&" would put the poller in a cgroup that systemd is
+# entitled to reap. systemd-run gives it its own unit, Restart=always, and a
+# clean kill at shutdown.
+#
+# ---------------------------------------------------------------------------
+# OUTPUT FORMAT -- /run/vpn-status, mode 0644.
+#
+# /run is tmpfs, so the file is empty at boot by definition and can never
+# persist into a fresh disposable. That is the correct lifetime for live state.
+#
+#   line 1   <state> <armed> <epoch>
+#   line 2   tunnel detail   (human)
+#   line 3   firewall detail (human)
+#
+#   state:  up | down | unknown
+#   armed:  armed | open | unknown
+#
+# Line 1 is built ONLY from words this script chooses. Nothing derived from a
+# config file, a filename or the network can ever reach it, so a reader may
+# parse it with a bare "read" and trust the result completely.
+#
+# Lines 2 and 3 are prose and may embed one untrusted value: the selected
+# config's filename, which comes out of the provider's download. It is scrubbed
+# by sanitise() before it goes in. That scrubbing happens HERE, once, rather
+# than in each reader, so every consumer inherits it -- including any future
+# notify-send, where the string would cross into dom0 and be rendered there.
+# ---------------------------------------------------------------------------
+
+set -u
+
+STATUS=/run/vpn-status
+TMP=/run/.vpn-status.$$
+SELECTED=/run/vpn-selected
+INTERVAL=30
+
+# A live WireGuard peer rehandshakes about every 2 minutes while traffic is
+# flowing, and retries every 5s while trying to establish. 180s is two missed
+# cycles: long enough not to flap on an idle link, short enough to notice.
+WG_STALE=180
+
+trap 'rm -f "$TMP"; exit 0' INT TERM
+
+# Reduce an untrusted string to printable ASCII, collapse runs of anything
+# else to a single space, and cap the length. Without this a .conf filename
+# containing terminal escape sequences could scribble on the terminal of
+# whoever prints the banner.
+sanitise() {
+    printf '%s' "$1" \
+        | tr -d '\000-\037\177' \
+        | tr -cs 'A-Za-z0-9._-' ' ' \
+        | cut -c1-64
+}
+
+# ---------------------------------------------------------------------------
+# Is the kill switch loaded?
+#
+# The test is that the chain ENDS in an unconditional drop -- the same
+# assertion vpn-firewall-apply makes in dom0, applied here to the in-qube half.
+# Counting rules is not sufficient: the terminal drop is the thing that makes
+# custom-forward fail closed, because the Qubes base forward chain it would
+# otherwise fall through to is policy accept.
+# ---------------------------------------------------------------------------
+check_firewall() {
+    fw_state=unknown
+    fw_detail="cannot determine firewall state"
+
+    if ! command -v nft >/dev/null 2>&1; then
+        fw_detail="nft not installed - cannot verify kill switch"
+        return
+    fi
+
+    if ! out=$(nft -a list chain ip qubes custom-forward 2>/dev/null); then
+        # Not an error we can shrug at. No chain means nothing is intercepting
+        # forwarded traffic, and the base chain accepts by policy.
+        fw_state=open
+        fw_detail="custom-forward chain MISSING - base chain is policy accept"
+        return
+    fi
+
+    # Every rule line carries a "# handle N" comment, and so does the
+    # "chain ... {" line, hence the -1.
+    h=$(printf '%s\n' "$out" | grep -c '# handle ')
+    if [ "$h" -gt 0 ]; then rules=$((h - 1)); else rules=0; fi
+
+    # Last line that is neither blank nor a closing brace, with its handle
+    # comment and surrounding space stripped.
+    last=$(printf '%s\n' "$out" \
+           | grep -vE '^[[:space:]]*\}?[[:space:]]*$' \
+           | tail -1 \
+           | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+    if [ "$last" = "drop" ]; then
+        fw_state=armed
+        fw_detail="kill switch armed - $rules rules, terminal drop present"
+    else
+        fw_state=open
+        fw_detail="KILL SWITCH NOT ARMED - $rules rules, chain does not end in drop"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Is the tunnel actually carrying traffic?
+# ---------------------------------------------------------------------------
+check_tunnel() {
+    tun_state=down
+    tun_detail="no tunnel"
+
+    if [ -z "$VPN_IF" ]; then
+        tun_state=unknown
+        tun_detail="no VPN_IF in /rw/config/vpn-params"
+        return
+    fi
+
+    if [ ! -e "/sys/class/net/$VPN_IF" ]; then
+        tun_detail="${PROTOCOL:-tunnel}: interface $VPN_IF does not exist"
+        return
+    fi
+
+    case "${PROTOCOL:-}" in
+      wireguard)
+        # Interface existence proves nothing here -- ask the peer.
+        hs=$(wg show "$VPN_IF" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+        if [ -z "$hs" ]; then
+            tun_detail="wireguard: $VPN_IF exists but has no peer configured"
+        elif [ "$hs" = "0" ]; then
+            tun_detail="wireguard: $VPN_IF up, peer has NEVER handshaked"
+        else
+            age=$(( $(date +%s) - hs ))
+            if [ "$age" -le "$WG_STALE" ]; then
+                tun_state=up
+                tun_detail="wireguard on $VPN_IF - last handshake ${age}s ago"
+            else
+                tun_detail="wireguard on $VPN_IF - last handshake ${age}s ago, stale (>${WG_STALE}s)"
+            fi
+        fi
+        ;;
+
+      openvpn)
+        if systemctl is-active --quiet openvpn-client@vpn 2>/dev/null; then
+            tun_state=up
+            tun_detail="openvpn on $VPN_IF - openvpn-client@vpn active"
+        else
+            st=$(systemctl is-active openvpn-client@vpn 2>/dev/null)
+            tun_detail="openvpn on $VPN_IF - openvpn-client@vpn is ${st:-unknown}"
+        fi
+        ;;
+
+      *)
+        tun_state=unknown
+        tun_detail="unknown PROTOCOL in /rw/config/vpn-params"
+        ;;
+    esac
+
+    # Which config was chosen. vpn-up writes this at selection time; it is the
+    # one provider-controlled string in the output, so it is scrubbed.
+    if [ -r "$SELECTED" ]; then
+        sel=$(sanitise "$(head -c 256 "$SELECTED" 2>/dev/null | head -n 1)")
+        case "$sel" in
+            ''|' ') ;;
+            *) tun_detail="$tun_detail [$sel]" ;;
+        esac
+    fi
+}
+
+# ---------------------------------------------------------------------------
+while :; do
+    # Re-read every cycle rather than once at startup: the poller may well
+    # start before salt-managed files have settled, and re-reading costs
+    # nothing at this interval.
+    PROTOCOL=""
+    VPN_IF=""
+    [ -r /rw/config/vpn-params ] && . /rw/config/vpn-params
+
+    check_tunnel
+    check_firewall
+
+    # Write to a temp file and rename. Rename within one filesystem is atomic,
+    # so a reader can never catch a half-written status.
+    {
+        printf '%s %s %s\n' "$tun_state" "$fw_state" "$(date +%s)"
+        printf '%s\n' "$tun_detail"
+        printf '%s\n' "$fw_detail"
+    } > "$TMP" || { sleep "$INTERVAL"; continue; }
+
+    chmod 0644 "$TMP" 2>/dev/null
+    mv -f "$TMP" "$STATUS" 2>/dev/null
+
+    sleep "$INTERVAL"
+done

@@ -431,6 +431,54 @@ Because the VPN qube is a disposable, this runs fresh every time:
    they come online, reading the value from `/rw/config/vpn-params` (this
    hook runs with a bare environment, so it can't rely on an inherited
    shell variable).
+6. `rc.local` installs the terminal banner and starts the status poller —
+   both *before* calling `vpn-up`, deliberately, since the case where you
+   most want status reporting is the one where bring-up fails.
+
+### Status reporting
+
+Two files, one privileged and one not, with a tmpfs file between them.
+
+- **`vpn-statusd`** runs as root and writes `/run/vpn-status` every 30s. It
+  has to be privileged because both interesting facts are: reading the
+  nftables ruleset needs root, and WireGuard liveness needs `CAP_NET_ADMIN`.
+  The latter is not a detail — WireGuard has no connection state, so
+  `wg-quick` leaves the interface present whether or not the peer ever
+  answers. Interface existence reports healthy on a dead tunnel; only
+  `latest-handshakes` distinguishes them. OpenVPN, having an actual daemon,
+  is answered by `systemctl is-active`, which works unprivileged.
+- **`vpn-status.sh`** is sourced by every interactive shell and only reads
+  that file. It needs no privilege and never touches the network.
+
+The split exists so exactly one component is privileged and every consumer —
+the banner, the prompt marker, anything added later — is not.
+
+The file's first line is fixed vocabulary chosen by `vpn-statusd`
+(`up|down|unknown`, `armed|open|unknown`, epoch) and can never contain
+anything derived from a config file or the network, so readers may parse it
+with a bare `read`. The prose lines may embed one untrusted value, the
+selected config's filename, which comes from the provider's download and is
+scrubbed to printable ASCII **at write time** rather than in each reader — so
+every consumer inherits the scrubbing, including any future one that forwards
+the string to dom0. That matters more in 4.3 than it used to: `notify-send` is
+no longer rendered locally, it is proxied over qrexec to dom0.
+
+Two deployment constraints drive the rest:
+
+- `/etc/profile.d/` is on the **root volume**, discarded at shutdown and
+  re-copied from the base template. A file placed there never reaches a
+  disposable. The master lives at `/rw/config/vpn-status.sh` on the private
+  volume, and `rc.local` installs it each boot.
+- `qubes-misc-post.service`, which runs `rc.local`, is `Type=oneshot`. A
+  backgrounded child sits in a cgroup systemd may reap, so the poller is
+  launched with `systemd-run` as a transient unit instead — which also gives
+  it `Restart=always` and makes it inspectable via `systemctl status
+  vpn-statusd`.
+
+Staleness is handled in the shared reader rather than per-consumer: a status
+file older than 150 seconds (five missed cycles) is treated as no status at
+all. Otherwise the prompt marker keeps reporting a tunnel nobody has checked
+since the poller died.
 
 ## 7. Notes verified against a running qube
 
@@ -452,6 +500,22 @@ Because the VPN qube is a disposable, this runs fresh every time:
   at rule-load time; `oif eth0` (index match) does not — this is why
   interface detection in `qubes-firewall-user-script` can safely reference
   an interface that may not exist yet.
+- `systemd-run --unit=... --property=Restart=always --collect` produces a
+  transient unit that outlives the shell that launched it, keeps running,
+  and stops cleanly — confirmed by running one, not by reading the manual.
+- `systemctl is-active` answers for an unprivileged user, which is what makes
+  the OpenVPN branch of `vpn-statusd` cheap.
+- `/etc/bashrc` sources `/etc/profile.d/*.sh` for **non-login** interactive
+  shells too, not only login shells, and suppresses their output when `$PS1`
+  is unset. That is what makes a `profile.d` banner fire on an ordinary
+  terminal while staying silent in scripts.
+- In Qubes 4.3 `notify-send` inside a qube is **not** rendered locally.
+  `qubes-notification-agent` claims `org.freedesktop.Notifications` on the
+  session bus and proxies over qrexec to dom0
+  (`GetServerInformation` returns `Qubes OS Notification Proxy`), so dom0
+  renders qube-supplied strings. This reverses the pre-4.3 situation, where
+  the qube drew its own notification and dom0 only composited a bordered
+  window.
 
 ## 8. External validation
 

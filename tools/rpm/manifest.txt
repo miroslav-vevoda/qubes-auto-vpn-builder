@@ -55,13 +55,16 @@
 0644 srv/user_salt/vpn/dispvm.sls
 0644 srv/user_salt/vpn/vmfiles.sls
 
-# vpn-params.jinja is a template salt renders. The other four run inside the
-# VPN qube and must be executable -- qubes-firewall gates on os.access(X_OK)
-# and skips a non-executable script SILENTLY.
+# vpn-params.jinja is a template salt renders, and vpn-status.sh is sourced by
+# the shell rather than run. The other five execute inside the VPN qube and
+# must be executable -- qubes-firewall gates on os.access(X_OK) and skips a
+# non-executable script SILENTLY.
 0644 srv/user_salt/vpn/files/vpn-params.jinja
+0644 srv/user_salt/vpn/files/vpn-status.sh
 0755 srv/user_salt/vpn/files/qubes-firewall-user-script
 0755 srv/user_salt/vpn/files/90-vif-mtu
 0755 srv/user_salt/vpn/files/vpn-up
+0755 srv/user_salt/vpn/files/vpn-statusd
 0755 srv/user_salt/vpn/files/rc.local
 
 # --- reference ----------------------------------------------------------------

@@ -61,6 +61,26 @@
     - group: root
     - mode: '0755'
 
+# Root-side tunnel status poller, started by rc.local through systemd-run.
+# Writes /run/vpn-status; everything else reads that and needs no privilege.
+/rw/config/vpn-statusd:
+  file.managed:
+    - source: salt://vpn/files/vpn-statusd
+    - user: root
+    - group: root
+    - mode: '0755'
+
+# The terminal banner. 0644 because it is SOURCED, not executed. It is not
+# deployed to /etc/profile.d directly: /etc lives on the root volume, which is
+# discarded at shutdown and re-copied from the base template, so a file placed
+# there would never reach a disposable. rc.local installs it at every boot.
+/rw/config/vpn-status.sh:
+  file.managed:
+    - source: salt://vpn/files/vpn-status.sh
+    - user: root
+    - group: root
+    - mode: '0644'
+
 # Where vpn-config-files-vm's pushed configs are moved to by vpn-up.
 /rw/config/vpn:
   file.directory:

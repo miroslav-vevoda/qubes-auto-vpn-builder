@@ -17,6 +17,7 @@ projects.
 - [Using it](#using-it) — the four steps, briefly
 - [Step 1 in detail: preparing your provider's configs](#step-1-in-detail-preparing-your-providers-configs) — the endpoint map
 - [What happens when you run the build](#what-happens-when-you-run-the-build) — the full flow, build through first start
+- [Seeing the status](#seeing-the-status) — terminal banner and prompt marker
 - [Repository layout](#repository-layout)
 - [Install order](#install-order) — the commands
 - [Building several qubes](#building-several-qubes) — chaining
@@ -277,9 +278,12 @@ why an explicit `qvm-prefs` value on it survives resets.
    and — the one value taken from your settings file — `netvm` set to the qube
    your `uplink=` named.
 3. **Install the scripts into the template.** `vpn-up`, `rc.local`, the
-   firewall script, the MTU hook and the rendered `vpn-params` file are placed
-   inside the AppVM template, so every disposable started from it has them
-   already. This step runs through the management disposable rather than dom0.
+   firewall script, the MTU hook, the status poller and banner, and the
+   rendered `vpn-params` file are placed inside the AppVM template, so every
+   disposable started from it has them already. They go into `/rw/config/`
+   specifically — that is on the private volume, which is the only thing a
+   disposable inherits. This step runs through the management disposable
+   rather than dom0.
 4. **Fetch the endpoint list.** dom0 asks `vpn-config-files-vm` for the
    `endpoint-map.txt` lines for your country and validates each one is a real
    IP and port — including rejecting octets with leading zeros — before any of
@@ -337,6 +341,10 @@ The disposable boots with a fresh root filesystem from the template, and:
    than falling open.
 6. **Downstream MTU is set** by the `90-vif-mtu` hook as other qubes attach,
    so their packets fit inside the tunnel's overhead.
+7. **The status poller starts.** `rc.local` also installs the terminal banner
+   into `/etc/profile.d/` and launches `vpn-statusd` as a transient systemd
+   unit. From then on, opening a terminal in the qube tells you where things
+   stand — see below.
 
 Now point other qubes at it:
 
@@ -344,8 +352,87 @@ Now point other qubes at it:
 qvm-prefs <some-qube> netvm <provider>-<sel>-vpn
 ```
 
-Every subsequent start repeats steps 1–6 from scratch. Nothing accumulates in
+Every subsequent start repeats steps 1–7 from scratch. Nothing accumulates in
 the disposable, and a broken tunnel is fixed by restarting it.
+
+## Seeing the status
+
+Open a terminal in the VPN qube and it tells you immediately:
+
+```
+  VPN    UP       wireguard on wireguard - last handshake 24s ago [uk123.nordvpn.com.conf]
+         ARMED    kill switch armed - 7 rules, terminal drop present
+```
+
+and when the tunnel has died:
+
+```
+  VPN    DOWN     wireguard on wireguard - last handshake 847s ago, stale (>180s)
+         ARMED    kill switch armed - 7 rules, terminal drop present
+```
+
+That second line is the one worth having. With a kill switch, a dead tunnel is
+silent by design — downstream qubes just stop working, and nothing tells you
+whether you are safely blocked or quietly leaking. `ARMED` means blocked.
+
+There is also a marker in the prompt, so it cannot go stale while you sit in
+the terminal:
+
+```
+[VPN up] [user@nordvpn-uk123-vpn ~]$
+```
+
+Opt out with `export VPN_STATUS_NO_PS1=1`.
+
+### Why it needs a root helper
+
+The two facts most worth knowing are both privileged, so a banner running as
+`user` cannot get at them:
+
+- **WireGuard has no connection state.** `wg-quick` creates the interface and
+  it stays there forever whether or not the peer ever answers a single packet.
+  Checking `/sys/class/net/wireguard` reports green on a stone dead tunnel. The
+  only real signal is the last handshake time, and reading it needs
+  `CAP_NET_ADMIN`.
+- **Reading the nftables ruleset needs root**, so nothing unprivileged can
+  confirm the kill switch is loaded.
+
+So `vpn-statusd` runs as root, checks every 30 seconds, and writes its verdict
+to `/run/vpn-status` — mode `0644`, on tmpfs, so it is empty at boot by
+definition and can never persist into a fresh disposable. Everything else just
+reads that file and needs no privilege at all.
+
+It is launched with `systemd-run` rather than `&`, because the unit that runs
+`rc.local` (`qubes-misc-post.service`) is `Type=oneshot` and a plain background
+child sits in a cgroup systemd may reap. As a transient unit it restarts if it
+dies and is inspectable:
+
+```sh
+systemctl status vpn-statusd
+journalctl -u vpn-statusd
+```
+
+If the poller dies, the banner says so rather than showing you its last known
+state — both it and the prompt marker treat a status file older than 150
+seconds as no status at all.
+
+### Where the files live, and why
+
+`/etc/profile.d/` is on the **root volume**, which is a copy-on-write snapshot
+of the base template, discarded at shutdown and re-copied at every start. A
+file placed there would never reach a disposable. Only the private volume
+(`/rw` and `/home`) is inherited. So the master copy lives at
+`/rw/config/vpn-status.sh` and `rc.local` installs it into place on every boot.
+
+### One thing it deliberately does not do
+
+It does not send anything to dom0. In Qubes 4.3 `notify-send` is **not** local
+— `qubes-notification-agent` proxies it over qrexec to dom0, which renders it.
+The one provider-controlled string in the status output is the selected
+config's filename, which comes out of your provider's download; `vpn-statusd`
+scrubs it to printable ASCII at write time rather than in each reader, so
+every consumer inherits that, including anything added later that does cross
+into dom0.
 
 ## Repository layout
 
@@ -357,7 +444,10 @@ dom0/                                    installed on dom0
       qubes-firewall-user-script         the kill switch
       90-vif-mtu                         MTU hook for downstream vifs
       vpn-up                             tunnel bring-up, run at boot
-      rc.local                           calls vpn-up
+      rc.local                           installs the banner, starts the
+                                         poller, then runs vpn-up
+      vpn-statusd                        root status poller -> /run/vpn-status
+      vpn-status.sh                      terminal banner + prompt marker
       vpn-params.jinja                   -> /rw/config/vpn-params
   srv/user_pillar/                       generated + example pillar data
   usr/local/bin/
@@ -653,6 +743,9 @@ sudo nft list chain ip  qubes custom-forward
 sudo nft list chain ip6 qubes custom-forward   # must not be empty
 ip link show wireguard                          # or vpn0
 sudo stat -c '%a %n' /rw/config/vpn/*.conf      # 600
+
+systemctl status vpn-statusd                    # the status poller
+cat /run/vpn-status                             # what the banner is reading
 ```
 
 Every `accept` in `custom-forward` must name the tunnel interface, and the
@@ -692,6 +785,31 @@ silently rewriting shebangs in the payload, and the signing-key check being
 impossible to pass on rpm 6. Both fixed; the detail, and why the hostile
 package is in the repo at all, is in
 [`docs/getting-files-into-dom0.md`](docs/getting-files-into-dom0.md).
+
+**The status indicator** (same qube, Fedora 43). Verified by running it:
+
+- `systemd-run` keeps a transient unit alive after the launching script exits,
+  restarts it, and stops it cleanly — which is why `rc.local` uses it rather
+  than `&`
+- the kill-switch parser, against synthetic nftables chains covering all four
+  cases: chain absent, chain empty, the real 7-rule ruleset, and the ruleset
+  with its terminal `drop` removed. The last is the one that matters — a
+  chain ending in `oifname "eth0" drop` still contains a drop but is not
+  fail-closed, and is correctly reported as `open`
+- the filename sanitiser, against a name carrying ANSI escapes and a
+  `$(...)` substitution: escapes neutralised, no command execution
+- the banner in every state — healthy, tunnel down, poller dead, status file
+  corrupt, truncated, and absent — plus silence in a non-interactive shell and
+  colour suppressed when stdout is not a tty
+
+That found one bug: the prompt marker read the state word without checking the
+timestamp, so it kept reporting `[VPN up]` after the poller had died. The
+staleness check now lives in the shared reader, so the banner and the marker
+cannot disagree.
+
+**Not verified:** the WireGuard and OpenVPN branches of `vpn-statusd` have not
+run against a live tunnel — the authoring qube has neither. The handshake-age
+logic and the `openvpn-client@vpn` unit query are reasoned-through only.
 
 **Not checked** — dom0 was not accessible from the authoring qube:
 
