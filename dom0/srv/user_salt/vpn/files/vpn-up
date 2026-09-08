@@ -43,144 +43,405 @@ chmod 600 "$CONF_DIR"/*.conf 2>/dev/null || true
 set -- "$CONF_DIR"/*.conf
 [ -e "$1" ] || { log "no configs in $CONF_DIR"; exit 1; }
 
+# The IP:PORT dom0 whitelisted for a config filename, or empty.
+#
+# This is the ONLY place the map is read. The random pool filter below and the
+# tunnel setup further down both go through it, so they cannot end up
+# disagreeing about which configs have an endpoint -- which is the same class
+# of bug the filter itself exists to close, one level down.
+#
+# One awk per candidate. For a country folder of a few hundred configs that is
+# a fraction of a second at boot; it is spent deliberately, because a single
+# shared lookup is worth more here than a faster one-pass filter that the
+# consumer below would then have to duplicate.
+map_lookup() {
+    [ -f "$MAP" ] || return 0
+    awk -v f="$1" '$1 == f { print $2; exit }' "$MAP"
+}
+
+# The transport dom0 whitelisted this endpoint on -- the map's optional third
+# column -- or empty for a map written before that column existed.
+#
+# Not folded into map_lookup: the pool filter only asks whether an endpoint
+# exists at all, and this is extra detail about a config already admitted. Its
+# absence is handled by falling back to the global setting, so the two cannot
+# disagree about which configs are usable.
+map_proto() {
+    [ -f "$MAP" ] || return 0
+    awk -v f="$1" '$1 == f { print $3; exit }' "$MAP"
+}
+
 if [ "$MODE" = "random" ]; then
-    # Pick by index rather than parsing ls output, so a newline in a filename
-    # cannot split one name into two.
-    conf_i=$(shuf -i "1-$#" -n 1)
-    eval "conf=\${$conf_i}"
+    # Only configs dom0 has whitelisted an endpoint for may enter the pool.
+    #
+    # Without this the pool comes from a bare *.conf glob, while the firewall's
+    # allow list is built separately in dom0 from endpoint-map.txt behind a much
+    # stricter regex. A config that passes the glob but not the regex -- a
+    # provider's second suffix, as in "uk123.nordvpn.com.tcp.conf", or a server
+    # build-endpoint-map.sh could not resolve -- joins the pool with no rule
+    # behind it. It then fails on whichever boot shuf happens to pick it:
+    # intermittently, possibly weeks later, and with the kill switch working
+    # exactly as intended the only symptom is downstream qubes losing the
+    # network. Excluding it here makes it unpickable instead.
+    if [ ! -f "$MAP" ]; then
+        log "no $MAP - dom0 has whitelisted nothing, so no config can work"
+        log "run tools/build-endpoint-map.sh over the configs and re-run vpn-build"
+        exit 1
+    fi
+
+    # Filter by rotating the positional parameters -- read $1, shift, append it
+    # back only if it is keepable -- rather than by rebuilding a list as a
+    # string. That preserves the newline-safety the index-based pick relies on.
+    pool_total=$#
+    pool_skipped=0
+    pool_shown=0
+    pool_i=0
+    while [ "$pool_i" -lt "$pool_total" ]; do
+        cand=$1
+        shift
+        if [ -n "$(map_lookup "${cand##*/}")" ]; then
+            set -- "$@" "$cand"
+        else
+            pool_skipped=$((pool_skipped + 1))
+            # Bounded: a large folder with a stale map must not turn one boot
+            # into thousands of log lines.
+            if [ "$pool_shown" -lt 10 ]; then
+                log "excluded ${cand##*/} - no endpoint-map entry, dom0 has not whitelisted it"
+                pool_shown=$((pool_shown + 1))
+            fi
+        fi
+        pool_i=$((pool_i + 1))
+    done
+    if [ "$pool_skipped" -gt "$pool_shown" ]; then
+        log "and $((pool_skipped - pool_shown)) more excluded for the same reason"
+    fi
+
+    if [ "$#" -eq 0 ]; then
+        log "none of $pool_total configs has an endpoint-map entry - qube stays kill-switched"
+        log "regenerate the map with tools/build-endpoint-map.sh and re-run vpn-build"
+        exit 1
+    fi
+    log "random pool: $# of $pool_total configs have a whitelisted endpoint"
+
+    # The pool is left in the positional parameters. The attempt loop below
+    # draws from it and removes each draw, so a dead server is never retried.
+    :
 else
-    conf=$1
+    set -- "$1"
 fi
-base=$(basename "$conf")
-log "selected $base"
+
+# --- how hard to try ---------------------------------------------------------
+#
+# A budget for boot delay as much as for reliability: three attempts at up to
+# LIVE_WAIT each is roughly 45s worst case before the qube stops trying and
+# settles. Providers do retire servers, and in random mode there are usually
+# dozens of alternatives sitting right there, so one dead draw should not cost
+# the whole boot -- but neither should a broken uplink stall it for minutes.
+MAX_ATTEMPTS=3
+
+# wg-quick returns as soon as the interface exists, and it exists whether or
+# not the peer ever answers -- WireGuard has no connection state. A live peer
+# retries its handshake about every 5 seconds, so this allows three chances.
+LIVE_WAIT=15
+
+# "systemctl start" returns once the unit has started, not once the tunnel is
+# up, and OpenVPN only creates the tun device after it has actually connected.
+IFACE_WAIT=30
+
+# Checked once, not per attempt: it cannot vary between configs.
+case "$PROTOCOL" in
+    wireguard|openvpn) ;;
+    *) log "unknown PROTOCOL '$PROTOCOL'"; exit 1 ;;
+esac
+
+# --- one attempt -------------------------------------------------------------
+#
+# These return rather than exit, so the caller can decide whether another
+# server is worth trying:
+#
+#   0  live tunnel
+#   1  no usable interface -- nothing to fall back to
+#   2  interface exists but the tunnel is not carrying traffic
+#   3  permanent, identical for every config -- retrying would only repeat it
+#
+# Note that under "set -e" a function called as an if-condition has errexit
+# suspended for its whole body, so anything load-bearing in here is checked
+# explicitly rather than left to abort the script.
+
+prepare_config() {   # $1 = config path, $2 = basename
+    _conf=$1
+    _base=$2
+
+    # The IP:PORT dom0 whitelisted for this config. Taken from the map rather
+    # than from the config body, so the tunnel can only be aimed at an address
+    # the firewall already allows. In random mode this is guaranteed non-empty:
+    # the pool filter dropped everything this same lookup could not resolve.
+    endpoint=$(map_lookup "$_base")
+
+    case "$PROTOCOL" in
+      wireguard)
+        # The interface is named after the config FILENAME, and the kernel caps
+        # interface names at 15 chars -- "uk123.nordvpn.com" is 17 and fails
+        # outright. So it is always installed under the fixed name below.
+        mkdir -p /etc/wireguard || return 3
+        install -m 600 /dev/null /etc/wireguard/wireguard.conf || return 3
+        # Inject MTU into [Interface] if the config does not set one.
+        if grep -qi '^[[:space:]]*MTU[[:space:]]*=' "$_conf"; then
+            cat "$_conf" > /etc/wireguard/wireguard.conf || return 1
+        else
+            awk -v mtu="$MTU" '
+                { print }
+                /^[[:space:]]*\[Interface\][[:space:]]*$/ { print "MTU = " mtu }
+            ' "$_conf" > /etc/wireguard/wireguard.conf || return 1
+        fi
+
+        # If the config aims somewhere dom0 did not whitelist, the handshake is
+        # simply dropped and the tunnel hangs with no explanation. Say so.
+        if [ -n "$endpoint" ]; then
+            cfg_ep=$(awk -F= '
+                /^[[:space:]]*[Ee]ndpoint[[:space:]]*=/ {
+                    gsub(/[[:space:]]/, "", $2); print $2; exit
+                }' "$_conf")
+            if [ "$cfg_ep" != "$endpoint" ]; then
+                log "WARNING: config endpoint '$cfg_ep' is not the whitelisted '$endpoint' - the firewall will block it"
+            fi
+        fi
+        ;;
+
+      openvpn)
+        # DNS is dropped by the dom0 firewall (drop specialtarget=dns), so a
+        # hostname in "remote" can never resolve. The endpoint map is what
+        # makes OpenVPN usable here; without an entry, fail rather than hang.
+        if [ -z "$endpoint" ]; then
+            log "no endpoint-map entry for $_base - DNS is blocked, so a hostname remote cannot resolve"
+            return 1
+        fi
+        ovpn_host=${endpoint%:*}
+        ovpn_port=${endpoint##*:}
+
+        # Transport per config, from the map's third column.
+        #
+        # A provider's country folder can mix UDP/1194 and TCP/443 servers, and
+        # transport= is a single value applied to the whole country. Before the
+        # map carried this, half a mixed folder was whitelisted on the wrong
+        # protocol and failed only on the boots that happened to draw it.
+        # A two-column map predates the column, so fall back and say so.
+        ep_proto=$(map_proto "$_base")
+        case "$ep_proto" in
+            udp|tcp) ;;
+            *)
+                ep_proto="${TRANSPORT:-udp}"
+                log "$_base has no transport in the endpoint map - assuming $ep_proto"
+                ;;
+        esac
+        if [ "$ep_proto" = tcp ]; then ovpn_proto="tcp-client"; else ovpn_proto="udp"; fi
+
+        mkdir -p /etc/openvpn/client || return 3
+        # 0600 before writing: an OpenVPN config routinely carries inline <key>
+        # blocks or auth-user-pass credentials. A bare "cat >" leaves it 0644.
+        install -m 600 /dev/null /etc/openvpn/client/vpn.conf || return 3
+
+        # An OpenVPN config that needs account credentials ships
+        # "auth-user-pass" with no filename, which means "prompt on the
+        # terminal". Under systemd there is no terminal, so the unit fails at
+        # startup with nothing useful in the log. Fail here instead, with the
+        # fix. Matches the directive whether or not it names a file: a config
+        # that points at its own credentials file is equally broken here,
+        # because only auth-user-pass.txt is ever shipped alongside the configs.
+        if [ ! -f "$AUTH" ] \
+           && grep -qiE '^[[:space:]]*auth-user-pass([[:space:]]|$)' "$_conf"; then
+            log "$_base needs account credentials but $AUTH is missing"
+            log "put them in vpn-config-files-vm:/home/user/configs/auth-user-pass.txt"
+            log "(line 1 username, line 2 password), then re-run vpn-build"
+            # The credentials file is account-wide, so every other config in
+            # the pool would fail identically. Retrying just logs this again.
+            return 3
+        fi
+
+        # Strip every directive we are about to set, then set it.
+        # "remote-cert-tls" and similar survive: the keyword must be followed
+        # by whitespace or end of line, and "remote-" is neither.
+        grep -v -iE '^[[:space:]]*(remote|proto|dev|dev-type|tun-mtu|auth-user-pass)([[:space:]]|$)' "$_conf" \
+            > /etc/openvpn/client/vpn.conf || true
+        {
+            printf 'remote %s %s\n' "$ovpn_host" "$ovpn_port"
+            printf 'proto %s\n'     "$ovpn_proto"
+            # Pin the device name so it is never a guess about tun numbering,
+            # and so it always matches what the firewall script expects.
+            printf 'dev-type tun\ndev %s\n' "$VPN_IF"
+            printf 'tun-mtu %s\n'   "$MTU"
+            # Point the directive at a file, so nothing is ever prompted for.
+            # Trailing "true": this is the last command in the group, and under
+            # "set -e" a false test here would abort the script.
+            if [ -f "$AUTH" ]; then printf 'auth-user-pass %s\n' "$AUTH"; fi
+            true
+        } >> /etc/openvpn/client/vpn.conf
+        ;;
+    esac
+    return 0
+}
+
+start_tunnel() {
+    case "$PROTOCOL" in
+      # The literal config name, not $VPN_IF: this is the filename installed
+      # above, and it is fixed for the interface-length reason given there.
+      wireguard) wg-quick up wireguard || return 1 ;;
+      openvpn)   systemctl start openvpn-client@vpn || return 1 ;;
+    esac
+    return 0
+}
+
+wait_for_iface() {
+    _w=0
+    while [ "$_w" -lt "$IFACE_WAIT" ]; do
+        if [ -e "/sys/class/net/$VPN_IF" ]; then return 0; fi
+        sleep 1
+        _w=$((_w + 1))
+    done
+    log "tunnel interface $VPN_IF never appeared after ${IFACE_WAIT}s"
+    return 1
+}
+
+verify_live() {
+    case "$PROTOCOL" in
+      wireguard)
+        # The interface existing proves nothing -- only a handshake separates a
+        # working tunnel from a dead peer. This is the check that makes retry
+        # meaningful: without it every attempt "succeeds".
+        _w=0
+        while [ "$_w" -lt "$LIVE_WAIT" ]; do
+            _hs=$(wg show "$VPN_IF" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+            case "${_hs:-}" in
+                ''|0|*[!0-9]*) ;;
+                *) log "peer handshaked after ${_w}s"; return 0 ;;
+            esac
+            sleep 1
+            _w=$((_w + 1))
+        done
+        log "no handshake from the peer after ${LIVE_WAIT}s"
+        return 2
+        ;;
+      openvpn)
+        # OpenVPN only creates the tun device once it has connected, so the
+        # interface wait already proved the tunnel established. What remains is
+        # to confirm the unit did not exit immediately afterwards.
+        if systemctl is-active --quiet openvpn-client@vpn; then return 0; fi
+        log "openvpn-client@vpn is not active"
+        return 2
+        ;;
+    esac
+    return 0
+}
+
+tear_down() {
+    case "$PROTOCOL" in
+      wireguard) wg-quick down wireguard >/dev/null 2>&1 || true ;;
+      openvpn)   systemctl stop openvpn-client@vpn >/dev/null 2>&1 || true ;;
+    esac
+    # Wait for the interface to actually go away. Without this the next
+    # attempt's interface wait passes instantly on the corpse of this one, and
+    # a dead tunnel gets reported as a live one.
+    _w=0
+    while [ -e "/sys/class/net/$VPN_IF" ] && [ "$_w" -lt 10 ]; do
+        sleep 1
+        _w=$((_w + 1))
+    done
+}
+
+attempt_up() {   # $1 = config path, $2 = basename
+    prepare_config "$1" "$2" || return $?
+    start_tunnel   || return 1
+    wait_for_iface || return 1
+    verify_live    || return $?
+}
+
+# --- the attempt loop --------------------------------------------------------
+
+live=0
+rc=1
+conf=""
+base=""
+attempt=0
+
+while [ "$#" -gt 0 ] && [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+
+    # Draw by index and remove the draw from the pool in the same pass, so a
+    # server that just failed is never tried again, and so a newline in a
+    # filename cannot split one name into two.
+    pick=$(shuf -i "1-$#" -n 1)
+    conf=""
+    idx=0
+    remaining=$#
+    while [ "$idx" -lt "$remaining" ]; do
+        idx=$((idx + 1))
+        cand=$1
+        shift
+        if [ "$idx" -eq "$pick" ]; then conf=$cand; else set -- "$@" "$cand"; fi
+    done
+    base=${conf##*/}
+
+    if [ "$MODE" = "random" ]; then
+        log "attempt $attempt/$MAX_ATTEMPTS: $base"
+    else
+        log "selected $base"
+    fi
+
+    rc=0
+    attempt_up "$conf" "$base" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        live=1
+        break
+    fi
+
+    if [ "$rc" -eq 3 ]; then
+        log "this failure affects every config equally - not trying another server"
+        break
+    fi
+
+    # Only tear down if something else is going to be tried. On the last
+    # attempt what is there is left in place -- see below.
+    if [ "$#" -gt 0 ] && [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+        log "$base did not come up - tearing it down and trying another server"
+        tear_down
+    else
+        log "$base did not come up, and there is nothing left to try"
+    fi
+done
 
 # Record the choice for vpn-statusd, which puts it in the terminal banner.
-# /run is tmpfs, so it never persists into a fresh disposable. vpn-statusd
-# scrubs this before printing it -- the name comes out of the provider's
-# download and is the one untrusted string in the status output.
+# Written after the loop so it names the config actually in use rather than the
+# first one tried. /run is tmpfs, so it never persists into a fresh disposable.
+# vpn-statusd scrubs this before printing it -- the name comes out of the
+# provider's download and is the one untrusted string in the status output.
 printf '%s\n' "$base" > /run/vpn-selected 2>/dev/null || true
 chmod 0644 /run/vpn-selected 2>/dev/null || true
 
-# The IP:PORT dom0 whitelisted for this config. Taken from the map rather than
-# from the config body, so the tunnel can only be aimed at an address the
-# firewall already allows.
-endpoint=""
-if [ -f "$MAP" ]; then
-    endpoint=$(awk -v f="$base" '$1 == f { print $2; exit }' "$MAP")
-fi
-
-case "$PROTOCOL" in
-  wireguard)
-    # The interface is named after the config FILENAME, and the kernel caps
-    # interface names at 15 chars -- "uk123.nordvpn.com" is 17 and fails
-    # outright. So it is always installed under the fixed name below.
-    mkdir -p /etc/wireguard
-    install -m 600 /dev/null /etc/wireguard/wireguard.conf
-    # Inject MTU into [Interface] if the config does not set one.
-    if grep -qi '^[[:space:]]*MTU[[:space:]]*=' "$conf"; then
-        cat "$conf" > /etc/wireguard/wireguard.conf
-    else
-        awk -v mtu="$MTU" '
-            { print }
-            /^[[:space:]]*\[Interface\][[:space:]]*$/ { print "MTU = " mtu }
-        ' "$conf" > /etc/wireguard/wireguard.conf
-    fi
-
-    # If the config aims somewhere dom0 did not whitelist, the handshake is
-    # simply dropped and the tunnel hangs with no explanation. Say so instead.
-    if [ -n "$endpoint" ]; then
-        cfg_ep=$(awk -F= '
-            /^[[:space:]]*[Ee]ndpoint[[:space:]]*=/ {
-                gsub(/[[:space:]]/, "", $2); print $2; exit
-            }' "$conf")
-        [ "$cfg_ep" = "$endpoint" ] || log \
-            "WARNING: config endpoint '$cfg_ep' is not the whitelisted '$endpoint' - the firewall will block it"
-    fi
-
-    wg-quick up wireguard
-    ;;
-
-  openvpn)
-    # DNS is dropped by the dom0 firewall (drop specialtarget=dns), so a
-    # hostname in "remote" can never resolve. The endpoint map is what makes
-    # OpenVPN usable at all here; without it, fail loudly rather than hang.
-    [ -n "$endpoint" ] || {
-        log "no endpoint-map entry for $base - DNS is blocked, so a hostname remote cannot resolve"
-        exit 1
-    }
-    ovpn_host=${endpoint%:*}
-    ovpn_port=${endpoint##*:}
-
-    if [ "${TRANSPORT:-udp}" = "tcp" ]; then ovpn_proto="tcp-client"; else ovpn_proto="udp"; fi
-
-    mkdir -p /etc/openvpn/client
-    # 0600 before writing: an OpenVPN config routinely carries inline <key>
-    # blocks or auth-user-pass credentials. A bare "cat >" leaves it 0644.
-    install -m 600 /dev/null /etc/openvpn/client/vpn.conf
-
-    # An OpenVPN config that needs account credentials ships "auth-user-pass"
-    # with no filename, which means "prompt on the terminal". Under systemd
-    # there is no terminal, so the unit fails at startup with nothing useful in
-    # the log. Fail here instead, with the fix.
-    # Matches the directive whether or not it names a file: a config that
-    # points at its own credentials file is equally broken here, because only
-    # auth-user-pass.txt is ever shipped alongside the configs.
-    if [ ! -f "$AUTH" ] \
-       && grep -qiE '^[[:space:]]*auth-user-pass([[:space:]]|$)' "$conf"; then
-        log "$base needs account credentials but $AUTH is missing"
-        log "put them in vpn-config-files-vm:/home/user/configs/auth-user-pass.txt"
-        log "(line 1 username, line 2 password), then re-run vpn-build"
+if [ "$live" -eq 0 ]; then
+    if [ "$rc" -ne 2 ]; then
+        # No usable interface at all. Re-run the firewall script so its
+        # detection matches reality -- with no VPN_IF it installs the bare kill
+        # switch -- then fail, exactly as this script did before retrying.
+        log "no tunnel interface - qube stays kill-switched"
+        /rw/config/qubes-firewall-user-script || true
         exit 1
     fi
-
-    # Strip every directive we are about to set, then set it. "remote-cert-tls"
-    # and similar survive: the keyword must be followed by whitespace or end of
-    # line, and "remote-" is neither.
-    grep -v -iE '^[[:space:]]*(remote|proto|dev|dev-type|tun-mtu|auth-user-pass)([[:space:]]|$)' "$conf" \
-        > /etc/openvpn/client/vpn.conf || true
-    {
-        printf 'remote %s %s\n' "$ovpn_host" "$ovpn_port"
-        printf 'proto %s\n'     "$ovpn_proto"
-        # Pin the device name so it is never a guess about tun numbering, and
-        # so it always matches what the firewall script was told to expect.
-        printf 'dev-type tun\ndev %s\n' "$VPN_IF"
-        printf 'tun-mtu %s\n'   "$MTU"
-        # Point the directive at a file, so nothing is ever prompted for.
-        # Trailing "true": this is the last command in the group, and under
-        # "set -e" a false test here would abort the script.
-        if [ -f "$AUTH" ]; then printf 'auth-user-pass %s\n' "$AUTH"; fi
-        true
-    } >> /etc/openvpn/client/vpn.conf
-
-    systemctl start openvpn-client@vpn
-    ;;
-
-  *)
-    log "unknown PROTOCOL '$PROTOCOL'"
-    exit 1
-    ;;
-esac
-
-# wg-quick creates the interface synchronously, but "systemctl start" returns
-# as soon as the unit is started, not when the tunnel is actually up. Wait for
-# the interface before re-applying the firewall, or its detection runs against
-# a state that does not exist yet and the qube stays kill-switched for good.
-waited=0
-while [ "$waited" -lt 30 ]; do
-    [ -e "/sys/class/net/$VPN_IF" ] && break
-    sleep 1
-    waited=$((waited + 1))
-done
-
-if [ ! -e "/sys/class/net/$VPN_IF" ]; then
-    log "tunnel interface $VPN_IF never appeared after ${waited}s - qube stays kill-switched"
-    /rw/config/qubes-firewall-user-script || true
-    exit 1
+    # rc = 2: the interface is there but the peer has not answered. Left up on
+    # purpose rather than torn down. WireGuard is connectionless, so a server
+    # that is merely slow or briefly unreachable will establish on its own,
+    # whereas tearing it down leaves the qube dead until someone notices and
+    # restarts it. Nothing leaks either way -- traffic can only leave through
+    # the tunnel -- and the status banner reports DOWN, so it is not silent.
+    log "WARNING: tunnel is up but has not carried traffic - it may still establish"
 fi
 
 # Re-run the firewall script now that the tunnel is real, so its detection and
 # its log line reflect reality.
 /rw/config/qubes-firewall-user-script || log "firewall script returned non-zero"
 
-log "tunnel up on $VPN_IF"
+if [ "$live" -eq 1 ]; then
+    log "tunnel up on $VPN_IF via $base"
+else
+    log "tunnel interface $VPN_IF present but unverified, via $base"
+fi
 exit 0

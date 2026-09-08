@@ -2,10 +2,18 @@
 #
 # /usr/local/bin/vpn-firewall-apply          (dom0)
 #
-# usage: vpn-firewall-apply [-p udp|tcp] <vm> <ip:port> [ip:port ...]
+# usage: vpn-firewall-apply [-p udp|tcp] <vm> <ip:port[/proto]> [...]
 #
 # <vm> must be the NAMED DISPOSABLE. Rules on the dvm template never filter
 # anything, because the template's netvm is none and it never runs.
+#
+# Each endpoint may carry its own protocol as "/udp" or "/tcp". -p sets the
+# default for endpoints that do not, which is what a map generated before the
+# protocol column existed produces. Per-endpoint protocols matter because a
+# country folder can legitimately mix UDP/1194 and TCP/443 servers: one
+# blanket protocol whitelists half of such a folder on the wrong one, and
+# because the config is chosen at random inside the qube, the result is a
+# tunnel that fails on some boots and not others.
 #
 # Final ruleset:
 #   0  drop specialtarget=dns
@@ -33,13 +41,8 @@ done
 
 [[ "$PROTO" =~ ^(udp|tcp)$ ]] || { echo "proto must be udp or tcp" >&2; exit 1; }
 
-VM="${1:?usage: vpn-firewall-apply [-p udp|tcp] <vm> <ip:port> ...}"; shift
+VM="${1:?usage: vpn-firewall-apply [-p udp|tcp] <vm> <ip:port[/proto]> ...}"; shift
 [ "$#" -gt 0 ] || { echo "no endpoints given" >&2; exit 1; }
-
-qvm-firewall "$VM" reset
-# Deterministic: reset leaves exactly one blanket accept at index 0. Delete it
-# immediately, while the index is unambiguous -- not after appending rules.
-qvm-firewall "$VM" del --rule-no 0
 
 # This is the last gate before an address becomes a firewall rule, so it
 # repeats the range and leading-zero checks vpn-endpoints-fetch already does
@@ -55,19 +58,62 @@ valid_ipv4() {
     return 0
 }
 
+# Validate EVERY endpoint before touching the live firewall. Applying as we go
+# and exiting on the first bad one would leave the qube mid-rewrite: the
+# blanket accept from "reset" already deleted, some accepts in place, and the
+# terminal drop -- added only after the loop -- never reached. That ruleset has
+# no final drop, so it fails open on exactly the path where something was
+# already wrong. Building the list first makes a rejected argument a no-op
+# against the running qube.
+declare -A SEEN=()
+RULES=()
 for ep in "$@"; do
+    # Split the optional "/proto" suffix off first, so the ":" split below is
+    # unaffected by it.
+    eproto="$PROTO"
+    if [[ "$ep" == */* ]]; then
+        eproto="${ep##*/}"
+        ep="${ep%/*}"
+        [[ "$eproto" =~ ^(udp|tcp)$ ]] || { echo "bad proto $eproto" >&2; exit 1; }
+    fi
+
     ip="${ep%:*}"; port="${ep##*:}"
     valid_ipv4 "$ip"                || { echo "bad ip $ip" >&2; exit 1; }
     [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) \
                                     || { echo "bad port $port" >&2; exit 1; }
-    qvm-firewall "$VM" add accept proto="$PROTO" dst4="$ip" dstports="$port"
+
+    # Providers point several configs at one address, so a country's map
+    # routinely repeats an endpoint. Each duplicate would be an identical
+    # firewall rule and, more to the point, another qvm-firewall round trip --
+    # which is the dominant cost of applying a large country. The key includes
+    # the protocol: the same host on udp and on tcp is two different rules.
+    key="$ip:$port/$eproto"
+    [ -z "${SEEN[$key]+x}" ] || continue
+    SEEN[$key]=1
+    RULES+=("$eproto $ip $port")
+done
+
+if (( $# > ${#RULES[@]} )); then
+    echo "collapsed $# endpoints to ${#RULES[@]} distinct rules" >&2
+fi
+
+qvm-firewall "$VM" reset
+# Deterministic: reset leaves exactly one blanket accept at index 0. Delete it
+# immediately, while the index is unambiguous -- not after appending rules.
+qvm-firewall "$VM" del --rule-no 0
+
+for rule in "${RULES[@]}"; do
+    read -r eproto ip port <<< "$rule"
+    qvm-firewall "$VM" add accept proto="$eproto" dst4="$ip" dstports="$port"
 done
 
 qvm-firewall "$VM" add --before 0 drop proto=icmp
 qvm-firewall "$VM" add --before 0 drop specialtarget=dns
 qvm-firewall "$VM" add drop
 
-echo "--- $VM firewall ($PROTO) ---"
+# Label the default, not "the" protocol: the rules below may carry a mix, and
+# the listing shows each rule's own proto anyway.
+echo "--- $VM firewall (default proto $PROTO) ---"
 qvm-firewall "$VM" list
 
 # Assert the last rule is an unconditional drop, rather than merely printing it.

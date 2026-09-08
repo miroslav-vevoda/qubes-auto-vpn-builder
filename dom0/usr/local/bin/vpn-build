@@ -43,7 +43,7 @@ QREXEC_TIMEOUT=120
 
 CONFIG_REL="${1:-vpn-selection.conf}"
 
-step "1/7  validate parameters from salt-configs-vm  ($CONFIG_REL)"
+step "1/8  validate parameters from salt-configs-vm  ($CONFIG_REL)"
 # vpn-params-fetch validates the path as well as the contents; nothing here
 # needs to pre-screen it.
 /usr/local/bin/vpn-params-fetch "$CONFIG_REL"
@@ -60,13 +60,13 @@ disp=$(read_pillar dispvm)
 [ -n "$transport" ] || die "could not read transport from pillar"
 [ -n "$uplink" ] || die "could not read uplink from pillar"
 
-step "2/7  create qubes  ($dvm, $disp)"
+step "2/8  create qubes  ($dvm, $disp)"
 qubesctl --show-output state.apply vpn
 
-step "3/7  place files inside $dvm"
+step "3/8  place files inside $dvm"
 qubesctl --skip-dom0 --targets="$dvm" --show-output state.apply vpn.vmfiles
 
-step "4/7  fetch and validate endpoints for $country"
+step "4/8  fetch and validate endpoints for $country"
 if [ "$mode" = "random" ]; then
     mapfile -t endpoints < <(/usr/local/bin/vpn-endpoints-fetch "$country")
 else
@@ -75,10 +75,10 @@ fi
 [ "${#endpoints[@]}" -gt 0 ] || die "no endpoints"
 echo "${#endpoints[@]} endpoint(s) whitelisted"
 
-step "5/7  apply firewall to $disp  (before any config exists)"
+step "5/8  apply firewall to $disp  (before any config exists)"
 /usr/local/bin/vpn-firewall-apply -p "$transport" "$disp" "${endpoints[@]}"
 
-step "6/7  push configs $VPNCONF_VM -> $dvm"
+step "6/8  push configs $VPNCONF_VM -> $dvm"
 # The tag set by salt is what the qubes.Filecopy policy keys on. dom0 decides
 # who is tagged; the config qube never learns the target from anywhere else.
 if [ "$mode" = "random" ]; then sel="ALL"; else sel="$server"; fi
@@ -87,7 +87,7 @@ printf '%s %s %s\n' "$dvm" "$country" "$sel" \
       qrexec-client -d "$VPNCONF_VM" "DEFAULT:QUBESRPC custom.VpnConfigPush dom0" \
     || die "config push failed (or timed out after ${QREXEC_TIMEOUT}s)"
 
-step "7/7  secure the delivered configs in $dvm"
+step "7/8  secure the delivered configs in $dvm"
 # qvm-copy-to-vm drops files in the template's home directory with whatever
 # mode they had. Move them into the root-owned 0700 directory and clear the
 # inbox, so the persistent copy is not left readable in /home/user.
@@ -103,6 +103,63 @@ qvm-run --no-gui -u root "$dvm" '
     chmod 644 /rw/config/vpn/endpoint-map.txt 2>/dev/null || true
     rm -rf /home/user/QubesIncoming
 ' || die "could not secure configs inside $dvm"
+
+step "8/8  check every delivered config has a whitelisted endpoint"
+# The pool the qube picks from and the allow list applied at step 5 are derived
+# independently: a bare *.conf glob in $VPNCONF_VM against regex-validated
+# endpoint-map lines here. vpn-up refuses to pick a config it cannot resolve to
+# a whitelisted endpoint, so a mismatch cannot open anything -- but it silently
+# shrinks the random pool. This makes it visible now rather than leaving it to
+# be handled quietly at some future boot.
+#
+# Counted in the template because that is where the two sets finally meet;
+# nothing else in the pipeline sees both. The counts come from an AppVM, so they
+# are validated as integers and only ever reported. dom0 does not act on them.
+counts=$(qvm-run --no-gui --pass-io -u root "$dvm" '
+    cd /rw/config/vpn 2>/dev/null || { echo "0 0"; exit 0; }
+    n=0; m=0
+    for f in *.conf; do
+        [ -e "$f" ] || continue
+        n=$((n + 1))
+        [ -f endpoint-map.txt ] || continue
+        while read -r name rest; do
+            [ "$name" = "$f" ] || continue
+            m=$((m + 1))
+            break
+        done < endpoint-map.txt
+    done
+    echo "$n $m"
+' 2>/dev/null) || counts=""
+
+n_conf=""; n_mapped=""
+read -r n_conf n_mapped _ <<< "$counts" || true
+# Digits are bounded, not just checked. "^[0-9]+$" accepts a 22-digit reply,
+# which then overflows bash arithmetic: "[: integer expected" on stderr and a
+# wrong verdict printed after it. Six digits is far beyond any real country
+# folder. n_mapped > n_conf is likewise impossible from the counter above, so
+# treat it as an unreadable answer rather than reporting "ok" on nonsense.
+if [[ "$n_conf" =~ ^[0-9]{1,6}$ ]] && [[ "$n_mapped" =~ ^[0-9]{1,6}$ ]] \
+   && [ "$n_mapped" -le "$n_conf" ]; then
+    if [ "$n_conf" -eq 0 ]; then
+        echo "WARNING: no .conf files found in $dvm:/rw/config/vpn" >&2
+    elif [ "$n_mapped" -lt "$n_conf" ]; then
+        cat >&2 <<WARN
+WARNING: $((n_conf - n_mapped)) of $n_conf delivered configs have no endpoint-map entry.
+
+         vpn-up will refuse to pick them, so the qube stays safe -- but the
+         random pool is smaller than the country folder suggests, and those
+         configs are dead weight in the template.
+
+         Regenerate the map in the qube where you downloaded the configs:
+           tools/build-endpoint-map.sh ~/configs
+         copy the folder back into $VPNCONF_VM, then re-run vpn-build.
+WARN
+    else
+        echo "ok: all $n_conf delivered configs have a whitelisted endpoint"
+    fi
+else
+    echo "warning: could not read config counts from $dvm - skipping the check" >&2
+fi
 
 # The copy started the template. It is meant never to run, so put it back.
 qvm-shutdown --wait "$dvm" || echo "warning: could not shut down $dvm" >&2

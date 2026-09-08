@@ -139,7 +139,10 @@ differently:
   `endpoint-map.txt` rides along with the configs in the same copy. It is
   metadata, not key material — the same lines `vpn-config-files-vm` already
   hands dom0 — and the VPN qube needs it locally because DNS is blocked
-  there (see §4).
+  there (see §4). Each line is
+  `<config-filename> <ip>:<port> <udp|tcp>`; the third column is optional so
+  that a map written before it existed still works, and its absence falls back
+  to the global `transport` with a warning (see §4).
 
   The map is built outside all three qubes, by `tools/build-endpoint-map.sh`,
   in the networked qube where the configs were downloaded. That placement is
@@ -310,17 +313,20 @@ delivered to the qube:
 ```
 0  drop specialtarget=dns
 1  drop proto=icmp
-2..N accept proto=<transport> dst4=<endpoint> dstports=<port>   (one per allowed endpoint)
+2..N accept proto=<per-endpoint> dst4=<endpoint> dstports=<port>   (one per allowed endpoint)
 N+1 drop
 ```
 
 built as:
 
 ```sh
+for ep in "$@"; do                        # validate everything first
+    ...                                   # collect into RULES[], deduplicated
+done
 qvm-firewall "$VM" reset
 qvm-firewall "$VM" del --rule-no 0        # remove the blanket accept `reset` leaves behind
-for ep in "$@"; do
-    qvm-firewall "$VM" add accept proto="$PROTO" dst4="$ip" dstports="$port"
+for rule in "${RULES[@]}"; do
+    qvm-firewall "$VM" add accept proto="$eproto" dst4="$ip" dstports="$port"
 done
 qvm-firewall "$VM" add --before 0 drop proto=icmp
 qvm-firewall "$VM" add --before 0 drop specialtarget=dns
@@ -331,11 +337,37 @@ qvm-firewall "$VM" add drop
 template's firewall rules never filter anything, since its `netvm` is
 `none` and it never runs.
 
-`$PROTO` comes from the `transport` setting (`udp` or `tcp`, default `udp`).
-WireGuard is always UDP and `vpn-params-fetch` rejects any other value with
-it; OpenVPN can be either, and whitelisting the wrong one makes the endpoint
-silently unreachable — hence an explicit setting rather than a hardcoded
-`udp`.
+**Validation is a separate pass from application, deliberately.** Applying as
+each endpoint is parsed and exiting on the first bad one leaves the qube
+mid-rewrite: the blanket accept from `reset` already deleted, some accepts in
+place, and the terminal `drop` — which is only added after the loop — never
+reached. A ruleset with no final drop fails *open*, on precisely the path where
+something was already wrong. Building the list first makes a rejected argument
+a no-op against the running qube.
+
+Duplicate endpoints are collapsed. Providers routinely point several configs at
+one address, so a country's map repeats endpoints; each duplicate would be an
+identical rule and, more to the point, another `qvm-firewall` round trip, which
+dominates the cost of applying a large country. The dedup key includes the
+protocol, so the same address on UDP and on TCP remains two rules.
+
+#### Protocol is per endpoint, not per country
+
+Each endpoint may carry its own protocol as `IP:PORT/PROTO`, taken from the
+third column of `endpoint-map.txt`. `-p` supplies the default for endpoints
+that do not, which is what a map generated before that column existed produces.
+
+This matters because `transport` is a single value applied to a whole country,
+while a provider's country folder can legitimately mix UDP/1194 and TCP/443
+servers. One blanket protocol whitelists half of such a folder on the wrong
+one. Since the config is chosen at random *inside* the qube (§6), the failure
+is intermittent: the tunnel works on boots that draw from the matching half and
+fails on the others, weeks apart, with no leak and no obvious cause — the kill
+switch is working exactly as designed, and downstream qubes simply lose the
+network.
+
+WireGuard is always UDP and `vpn-params-fetch` rejects any other value with it,
+so the column only ever varies for OpenVPN.
 
 The trailing `drop` has no address family, so it covers IPv6 as well as
 IPv4. After applying, `vpn-firewall-apply` asserts the last rule really is
@@ -386,27 +418,70 @@ Running `vpn-build` in dom0:
 4. **Fetch the endpoint list** for the chosen country from
    `vpn-config-files-vm`, validating each line.
 5. **Apply the firewall (Layer 2) before anything else happens** — the VPN
-   qube is locked to the whitelisted endpoints, on the configured transport,
-   before the actual config file is delivered, so there's no window where
-   it's open.
+   qube is locked to the whitelisted endpoints, each on the transport its own
+   map line names (falling back to the configured `transport` for a map that
+   predates that column), before the actual config file is delivered, so
+   there's no window where it's open.
 6. **Deliver the config files** (plus `endpoint-map.txt`) via the tagged
    qube-to-qube copy in §2. The contents do not pass through dom0 — see §2 for
    what that does and does not buy.
 7. **Secure the delivered files** — move them out of the template's
-   `~/QubesIncoming` into root-owned `0700` storage at `0600`, then shut the
-   template back down, since the copy is what started it.
+   `~/QubesIncoming` into root-owned `0700` storage at `0600`.
+8. **Reconcile the delivered configs against the whitelist**, then shut the
+   template back down, since the copy is what started it. Counted inside the
+   template because that is the only place both sets exist; the counts are
+   validated as bounded integers in dom0 and are reported, never acted on.
 
 Random-server selection (when only a country was chosen) happens inside the
 VPN qube at boot, not in dom0 — Layer 2 already allows every endpoint in
 that country, so picking one at random at boot doesn't need dom0 involved,
 and it keeps per-boot logic out of dom0.
 
+### The pool and the whitelist are two sets, built separately
+
+That independence is the point — `vpn-config-files-vm` never learns what dom0
+accepted, and dom0 never sees a config body. But it means the set of configs
+the qube can pick from and the set of endpoints Layer 2 allows are produced by
+different code under different rules: a `*.conf` glob in the AppVM against
+regex-validated `endpoint-map.txt` lines in dom0.
+
+A config can therefore pass one and fail the other. The concrete cases are a
+provider's second filename suffix (`uk123.nordvpn.com.tcp.conf`, which the
+glob takes and the dom0 regex rejects) and a config `build-endpoint-map.sh`
+could not resolve to an address. Either way the config reaches the pool with
+no firewall rule behind it.
+
+This never opens anything — the endpoint simply is not whitelisted, so the
+handshake is dropped. What it does is fail *intermittently*, on whichever boot
+`shuf` selects that config, and Layer 1 makes the symptom indistinguishable
+from ordinary tunnel failure.
+
+So random mode filters the pool at boot: `vpn-up` admits only configs the
+endpoint map resolves, logs the exclusions, and refuses to start if none
+qualify. The reconciliation in build step 8 makes the same mismatch visible up
+front. Both go through the *same* lookup used later to aim the tunnel
+(`map_lookup` in `vpn-up`), so the filter and its consumer cannot disagree —
+a disagreement there would just reproduce the original bug one level down.
+
+Specific mode is deliberately not filtered: you named one server, there is one
+config, and a missing map entry is already fatal for OpenVPN and warned about
+for WireGuard at the point the tunnel is aimed.
+
+The per-endpoint protocol column (§4) closes the same bug class along a second
+axis. There the two sets agree on *which* endpoints are allowed but disagree on
+*how*: dom0 whitelists a whole country on one `transport`, while the config the
+qube draws may want the other. The symptom is identical — intermittent, silent,
+and only on the boots that draw from the mismatched half — and so is the fix:
+make both sides read the protocol from the same map line rather than derive it
+separately.
+
 ## 6. What happens at boot
 
 Because the VPN qube is a disposable, this runs fresh every time:
 
-1. `vpn-up` picks a config — the specific server chosen, or a random one
-   from the country.
+1. `vpn-up` picks a config — the specific server chosen, or a random one from
+   the country's whitelisted subset (see §5). The draw is fresh each boot, so a
+   disposable restarted does not land on the same server.
 2. It's installed under a fixed filename regardless of the original
    provider filename (`/etc/wireguard/wireguard.conf` or
    `/etc/openvpn/client/vpn.conf`), mode `0600` in both cases — configs
@@ -415,25 +490,81 @@ Because the VPN qube is a disposable, this runs fresh every time:
    filenames like `uk123.nordvpn.com` exceed the kernel's 15-character
    `IFNAMSIZ` limit, so bring-up would fail under the original name.
 3. For OpenVPN, the `remote` line is rewritten to the IP from
-   `endpoint-map.txt` and the device name is pinned to the interface the
-   firewall was told to expect. Both are required, not cosmetic: DNS is
-   blocked, and a `dev` line inherited from the provider would produce an
-   interface name no rule matches. For WireGuard the config's `Endpoint` is
-   compared against the map and a mismatch is logged, since the symptom
-   otherwise is an unexplained hang.
-4. The tunnel comes up (`wg-quick` or `openvpn`). `wg-quick` creates the
-   interface synchronously, but `systemctl start` does not, so `vpn-up`
-   waits for the interface to appear (up to 30s) before re-running
-   `qubes-firewall-user-script`. Without the wait, detection would run
-   against an interface that doesn't exist yet and the qube would stay
-   kill-switched permanently.
-5. The MTU hook (`90-vif-mtu`) sets the correct MTU on downstream vifs as
+   `endpoint-map.txt`, the `proto` line to that map line's third column, and
+   the device name is pinned to the interface the firewall was told to expect.
+   All three are required, not cosmetic: DNS is blocked, a `dev` line inherited
+   from the provider would produce an interface name no rule matches, and
+   dialling a protocol dom0 did not whitelist for *this* endpoint is silently
+   dropped (see §4). A two-column map has no third field, so the global
+   `transport` is used and the fallback is logged. For WireGuard the config's
+   `Endpoint` is compared against the map and a mismatch is logged, since the
+   symptom otherwise is an unexplained hang.
+4. The tunnel comes up (`wg-quick` or `openvpn`), and is then checked for
+   *life* — see below. If it is dead, `vpn-up` tears it down, draws a different
+   config, and tries again, up to three attempts.
+5. `qubes-firewall-user-script` is re-run so its detection matches reality.
+   Without waiting for the interface first, detection would run against an
+   interface that doesn't exist yet and the qube would stay kill-switched
+   permanently.
+6. The MTU hook (`90-vif-mtu`) sets the correct MTU on downstream vifs as
    they come online, reading the value from `/rw/config/vpn-params` (this
    hook runs with a bare environment, so it can't rely on an inherited
    shell variable).
-6. `rc.local` installs the terminal banner and starts the status poller —
+7. `rc.local` installs the terminal banner and starts the status poller —
    both *before* calling `vpn-up`, deliberately, since the case where you
    most want status reporting is the one where bring-up fails.
+
+### A tunnel that exists is not a tunnel that works
+
+**WireGuard has no connection state.** `wg-quick up` creates the interface and
+returns whether or not the peer ever answers, so `/sys/class/net/<if>` existing
+reports a healthy tunnel on a dead server. Only `wg show <if> latest-handshakes`
+distinguishes them. This is the fact the whole retry design rests on: without a
+liveness check every attempt "succeeds", and retrying is meaningless. A live
+peer retries its handshake about every 5 seconds, so `vpn-up` allows 15.
+
+OpenVPN is the opposite: it creates the tun device only *after* connecting, so
+interface presence is itself the establishment signal, and what remains is
+confirming with `systemctl is-active` that the unit did not exit immediately
+afterwards.
+
+Each attempt therefore returns one of four things, and the caller — not the
+attempt — decides what to do:
+
+| | meaning | action |
+|---|---|---|
+| `0` | live tunnel | done |
+| `1` | no usable interface | try another server |
+| `2` | interface up, no traffic | try another server; on the last attempt, leave it up |
+| `3` | permanent and identical for every config | stop immediately |
+
+`3` exists so that an account-wide problem — a missing `auth-user-pass.txt`, an
+unwritable `/etc/wireguard` — does not burn the whole attempt budget logging the
+same message three times.
+
+The draw removes the config from the pool, so a server that just failed is never
+re-drawn. Teardown between attempts **waits for the interface to disappear**:
+without that, the next attempt's interface wait passes instantly on the corpse
+of the previous one and a dead tunnel is reported as live.
+
+The two terminal states are deliberately different. No interface at all means
+there is nothing to salvage, so `vpn-up` reapplies the kill switch and exits
+non-zero — exactly what it did before retrying existed. An interface that is up
+but never handshaked is *left in place*: WireGuard is connectionless, so a
+merely slow or briefly unreachable server may still establish on its own,
+whereas tearing it down leaves the qube dead until someone notices. Nothing
+leaks either way — traffic can only leave through the tunnel — and the status
+banner reports `DOWN`, so the degraded state is visible rather than silent.
+
+Three attempts at up to 15s is roughly 45s worst case. The budget is bounded for
+boot delay as much as for reliability: a broken uplink must not stall the qube
+for minutes. In specific-server mode there is exactly one config, so there is
+one attempt — there is nothing to fall back to, and silently substituting a
+different server would contradict the request.
+
+Under `set -e`, a function invoked as an `if` condition has errexit suspended
+for its entire body, so every load-bearing command inside these helpers is
+checked explicitly with `|| return N` rather than left to abort the script.
 
 ### Status reporting
 
@@ -620,7 +751,7 @@ be validated against, because they are properties of the set:
 | Name collisions | Two valid configs can derive the same qube names. Building both silently yields *one* qube, the second config's key material overwriting the first's. |
 | Uplink ordering | Requires knowing what the other configs build, and in what order. |
 | MTU descent | A property of a *pair*. Every MTU in a broken chain is inside 1280–1500, so each file passes alone. |
-| Endpoint availability | `vpn-build` does not discover this until step 4/7 — after it has created the qubes. Acceptable for one build, wrong mid-chain. |
+| Endpoint availability | `vpn-build` does not discover this until step 4/8 — after it has created the qubes. Acceptable for one build, wrong mid-chain. |
 
 All of it is read-only, and none of it runs after the first qube exists. A
 set failing any check is refused entirely. The reason is the failure mode: a

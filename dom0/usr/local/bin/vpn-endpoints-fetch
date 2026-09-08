@@ -3,7 +3,9 @@
 # /usr/local/bin/vpn-endpoints-fetch          (dom0)
 #
 # Ask vpn-config-files-vm for the endpoint map of one country and emit
-# validated "IP:PORT" lines on stdout.
+# validated "IP:PORT/PROTO" lines on stdout -- or bare "IP:PORT" for a map
+# written before the protocol column existed, leaving the caller to fall back
+# to the global transport= setting.
 #
 # usage: vpn-endpoints-fetch <country> [server-stem]
 #
@@ -39,6 +41,7 @@ raw=$(printf '%s\n' "$country" \
       || { echo "endpoint list request failed, timed out, or exceeded ${MAX_BYTES} bytes" >&2; exit 1; }
 
 found=0
+no_proto=0
 while IFS= read -r line; do
     [ -z "$line" ] && continue
     # The map carries a header written by tools/build-endpoint-map.sh. Skip
@@ -46,13 +49,19 @@ while IFS= read -r line; do
     # build prints a rejection warning per header line and the warning stops
     # meaning anything.
     case "$line" in \#*) continue ;; esac
-    # Expected: uk123.nordvpn.com.conf 1.2.3.4:1194
+    # Expected: uk123.nordvpn.com.conf 1.2.3.4:1194 udp
     # The TLD is not pinned to .com -- providers use .net and others.
-    if [[ ! "$line" =~ ^([a-z]{2}[0-9]{1,4})\.[a-z0-9-]+\.[a-z]{2,6}\.conf[[:space:]]+([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})$ ]]; then
+    #
+    # The protocol column is optional so that a map generated before it existed
+    # still works. Absent, the endpoint is emitted without one and vpn-build
+    # applies the global transport= to it, which is what the whole pipeline did
+    # previously -- see the warning at the end.
+    if [[ ! "$line" =~ ^([a-z]{2}[0-9]{1,4})\.[a-z0-9-]+\.[a-z]{2,6}\.conf[[:space:]]+([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]{1,5})([[:space:]]+(udp|tcp))?[[:space:]]*$ ]]; then
         echo "rejected malformed endpoint line" >&2
         continue
     fi
     lstem="${BASH_REMATCH[1]}"; ip="${BASH_REMATCH[2]}"; port="${BASH_REMATCH[4]}"
+    proto="${BASH_REMATCH[6]:-}"
 
     ok=1
     IFS='.' read -r a b c d <<< "$ip"
@@ -68,8 +77,24 @@ while IFS= read -r line; do
     # Specific-server mode: emit only the matching endpoint.
     [ -n "$stem" ] && [ "$lstem" != "$stem" ] && continue
 
-    printf '%s:%s\n' "$ip" "$port"
+    if [ -n "$proto" ]; then
+        printf '%s:%s/%s\n' "$ip" "$port" "$proto"
+    else
+        printf '%s:%s\n' "$ip" "$port"
+        no_proto=$((no_proto+1))
+    fi
     found=$((found+1))
 done <<< "$raw"
 
 [ "$found" -gt 0 ] || { echo "no usable endpoints for $country${stem:+/$stem}" >&2; exit 1; }
+
+# One warning for the whole map, not one per line. This is the condition under
+# which a mixed-transport country folder is still undetectable: every endpoint
+# gets the single global transport, so whichever half disagrees with it is
+# whitelisted on the wrong protocol and fails only when chosen.
+if [ "$no_proto" -gt 0 ]; then
+    echo "warning: $no_proto of $found endpoints carry no protocol column." >&2
+    echo "         They will be whitelisted on the global transport= setting." >&2
+    echo "         If this country mixes UDP and TCP servers, regenerate the map" >&2
+    echo "         with tools/build-endpoint-map.sh to whitelist each correctly." >&2
+fi
