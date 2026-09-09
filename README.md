@@ -24,6 +24,7 @@ projects.
 - [The two firewalls](#the-two-firewalls) — how the kill switch works
 - [Verify after build](#verify-after-build)
 - [Status: verified vs. assumed](#status-verified-vs-assumed) — what is actually tested
+- [Verifying the commits](#verifying-the-commits) — signing key fingerprint
 - [Support](#support)
 
 ---
@@ -1134,6 +1135,58 @@ exercised against stubs that model the documented behaviour, not against
   to watch when you first try it: whether your provider allows reaching one
   of its endpoints from inside another of its tunnels, and whether the real
   per-hop overhead matches the conservative figures above.
+
+## Verifying the commits
+
+Commits and tags in this repository are signed. If you have just cloned it and
+want to check that the history came from the author rather than from someone
+who gained write access, this is the key:
+
+```
+ed25519  17643D28C9E3F330A36EC07D03538794CECA9666
+         miroslav-vevoda <miroslav-vevoda@users.noreply.github.com>
+```
+
+Import it and verify:
+
+```sh
+gpg --import SIGNING-KEY.asc              # or: gpg --recv-keys 03538794CECA9666
+gpg --show-keys --fingerprint SIGNING-KEY.asc   # compare with the line above
+git verify-commit HEAD
+git log --show-signature | head -20
+```
+
+`git verify-commit` exits non-zero and prints nothing good if a commit is
+unsigned or signed by another key. To check the whole history at once:
+
+```sh
+git log --format='%H %G? %an' | awk '$2 != "G"'
+```
+
+Anything printed is a commit that does *not* carry a good signature from a key
+in your keyring. Commits before signing was introduced will show up here — the
+first signed commit is the one that adds this section.
+
+**What this does and does not prove.** A good signature says the commit was
+made by someone holding that private key. It says nothing about whether the
+code is correct or safe, and — the part worth being blunt about — **a
+fingerprint published in the repository it signs is circular.** Anyone who
+could rewrite the history could also rewrite this section. It has real value
+against a third party tampering with a clone or a mirror, and as a record that
+becomes harder to falsify the longer it stands, but if you want the strong
+version you need the fingerprint from somewhere I do not control: compare it
+against the copy on the author's GitHub profile, or a keyserver, or ask over a
+channel you already trust.
+
+Note also that git has no way to *require* a signature on clone. Verification
+happens on your side, against your keyring, which is why the fingerprint is
+published at all.
+
+**This is not the RPM signing key.** That one is generated in a separate
+offline build qube with `netvm none` and never touches a networked machine —
+see `docs/getting-files-into-dom0.md`. Two different keys for two different
+jobs: this one signs the source history, that one signs the package dom0
+installs. Do not use one for the other.
 
 ## Support
 
