@@ -904,13 +904,19 @@ set:
 - **The template's `netvm` is always blank.** `dvmtemplate.sls` sets it to
   `none` unconditionally, and `uplink=` has no bearing on it. If this is not
   blank, something is wrong.
-- **`qubes-firewall` must be on for the *disposable*, not just the template.**
-  It is what runs `qubes-firewall-user-script`, and that script is Layer 1. The
-  build sets it explicitly on both qubes rather than relying on the disposable
-  inheriting it from a template that has `netvm none` and never runs. Worth
-  checking directly, because the failure mode is quiet: with Layer 1 absent,
-  Layer 2 still confines the qube to its endpoint, so the kill-switch test
-  below would appear to pass while you were down to a single layer.
+- **`qubes-firewall` must show as on for the *disposable*.** It is enabled on
+  the dvm template and **inherited** — services are template-inherited, unlike
+  `netvm`, so it is set in one place only. This check confirms the inheritance
+  actually happened on your system.
+
+  It matters because that service creates the nftables `qubes` table and the
+  `custom-forward` chain that Layer 1 lives in, and it is what invokes
+  `qubes-firewall-user-script`. The script only ever adds rules to that chain,
+  never creating it, so without the service every invocation fails — including
+  the emergency kill switch it falls back to, which logs `EMERGENCY DROP ALSO
+  FAILED - assume leaking`. `vpn-up` re-running the script later cannot make up
+  for it.
+
   `network-manager` should be off — the uplink is a Qubes vif, not an
   NM-managed device.
 - **The disposable's `netvm` is the qube your `uplink=` named.** It should

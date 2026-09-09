@@ -44,29 +44,17 @@
     - require:
       - qvm: {{ v.dispvm }}-prefs
 
-# Set on the disposable EXPLICITLY, not left to inherit from the template.
+# No qvm.service block here on purpose.
 #
-# qubes-firewall is what runs qubes-firewall-user-script, and that script is
-# Layer 1 -- the in-qube kill switch. The template it would be inherited from
-# has netvm none and never runs, so enabling it there does nothing except be
-# inherited: the whole of Layer 1 would rest on that inheritance behaving as
-# expected. This file already declines to inherit netvm and provides_network
-# for the same class of reason, and the cost of being wrong is higher here.
+# The disposable needs qubes-firewall -- it is what creates the nftables
+# "qubes" table and the custom-forward chain that Layer 1 lives in, and what
+# invokes /rw/config/qubes-firewall-user-script. The script only ever does
+# "add rule ip qubes custom-forward ...", never creating the chain, so without
+# the service every invocation fails, including its own emergency-drop
+# fallback. vpn-up calling the script later cannot substitute for it.
 #
-# If inheritance does work, this is redundant and harmless. If it does not,
-# this is the difference between two independent enforcement layers and one --
-# and the difference would be close to invisible, because Layer 2 confines the
-# qube to its endpoint regardless, so the documented kill-switch test would
-# still appear to pass with Layer 1 entirely absent.
-#
-# network-manager stays disabled: the uplink is a Qubes vif, not an
-# NM-managed device, so NM here is attack surface and nothing else.
-{{ v.dispvm }}-services:
-  qvm.service:
-    - name: {{ v.dispvm }}
-    - enable:
-      - qubes-firewall
-    - disable:
-      - network-manager
-    - require:
-      - qvm: {{ v.dispvm }}-tags
+# But services ARE inherited from the dvm template, verified in dom0 against a
+# real build, so enabling it in dvmtemplate.sls covers this qube too. Setting
+# it again here would be redundant. netvm and provides_network above are a
+# different case: those are prefs, not features, and for a named disposable
+# the template's values are only a default.

@@ -227,23 +227,30 @@ Two qubes are created per selection:
   fail-closed default: anything created from this template without an explicit
   override gets no network path at all.
 - **The named disposable** (`…-vpn`) — created from that template, with
-  `netvm`, `provides_network` and its **services** set explicitly:
+  `netvm` and `provides_network` set explicitly:
 
   ```sh
   qvm-prefs nordvpn-uk123-vpn  netvm            sys-firewall
   qvm-prefs nordvpn-uk123-vpn  provides_network true
   ```
 
-  Services are set here rather than inherited. `qubes-firewall` is what runs
-  `qubes-firewall-user-script`, so Layer 1 depends on it — and the template it
-  would otherwise be inherited from has `netvm none` and never runs, meaning
-  the enable there exists *only* to be inherited. Setting it on the disposable
-  too costs nothing and removes the dependency on that inheritance. The
-  argument for being explicit is how quiet the failure would be: with Layer 1
-  absent, Layer 2 still confines the qube to its endpoint, so the documented
-  kill-switch test would appear to pass while enforcement had dropped from two
-  independent layers to one. `network-manager` is disabled on both qubes,
-  since the uplink is a Qubes vif and not an NM-managed device.
+  Its **services** are not set here, because features are inherited from the
+  dvm template (verified in dom0) — unlike `netvm` and `provides_network`
+  above, which are prefs and only default from the template. So
+  `qubes-firewall` is enabled once, in `dvmtemplate.sls`.
+
+  The disposable does need it, though, and for a more fundamental reason than
+  running the user script: **`qubes-firewall` is what creates the nftables
+  `qubes` table and the `custom-forward` chain.** The user script only ever
+  issues `add rule ip qubes custom-forward …` and never creates the chain, so
+  with no service there is nowhere for Layer 1 to live — every invocation
+  fails, and so does the bare kill switch it falls back to, which then logs
+  `EMERGENCY DROP ALSO FAILED - assume leaking`. `vpn-up` calling the script at
+  the end of bring-up therefore cannot substitute for the service; it depends
+  on it too.
+
+  `network-manager` is disabled for the same one-place reason: the uplink is a
+  Qubes vif, not an NM-managed device.
 
   It's a *named* disposable rather than an auto-named `disp####` because
   other qubes need to reference it by name as their `netvm`. An explicit
