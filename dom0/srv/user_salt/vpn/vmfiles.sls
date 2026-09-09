@@ -46,6 +46,9 @@
         mtu: {{ v.mtu }}
         mode: {{ v.mode }}
         vpn_if: {{ v.vpn_if }}
+        # Quoted: empty in random mode, and an unquoted empty value here
+        # renders as None rather than as nothing.
+        server: '{{ v.server }}'
 
 /rw/config/vpn-up:
   file.managed:

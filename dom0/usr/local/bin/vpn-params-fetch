@@ -64,6 +64,7 @@ raw=$(timeout "$TIMEOUT" qvm-run --pass-io --no-gui "$CONFIG_VM" "cat '$CONFIG_P
     || die "cannot read $CONFIG_PATH from $CONFIG_VM (or it timed out / exceeded ${MAX_BYTES} bytes)"
 
 protocol=""; mtu=""; selector=""; provider=""; transport=""; uplink=""
+instance=""
 
 # A repeated key silently taking the last value is exactly the kind of thing
 # that makes a config look like it says one thing while doing another. Refuse
@@ -95,6 +96,7 @@ while IFS= read -r line; do
         provider)  provider="$val" ;;
         transport) transport="$val" ;;
         uplink)    uplink="$val" ;;
+        instance)  instance="$val" ;;
         *)         die "unknown key '$key'" ;;
     esac
 done <<< "$raw"
@@ -104,6 +106,17 @@ done <<< "$raw"
 [ "$mtu" -ge 1280 ] && [ "$mtu" -le 1500 ] || die "mtu $mtu outside 1280-1500"
 [[ "$provider" =~ ^[a-z][a-z0-9]{1,15}$ ]] || die "bad provider '$provider'"
 [[ "$selector" =~ ^[a-z]{2}([0-9]{1,4})?$ ]] || die "bad selector '$selector'"
+
+# Which of several random qubes for the same country this one is. Only
+# meaningful in random mode: a specific server already names itself uniquely.
+#
+# Defaults to 1 rather than to empty, so the first random qube is
+# "<iso>-random1" and the second "<iso>-random2". An unnumbered first one
+# would read as though a number had been forgotten, and would then need
+# renaming -- along with the netvm of everything downstream of it -- the
+# moment a second was wanted.
+instance="${instance:-1}"
+[[ "$instance" =~ ^[1-9][0-9]?$ ]] || die "instance must be 1-99, got '$instance'"
 
 # Transport is what the dom0 firewall whitelists. WireGuard is UDP by
 # definition; OpenVPN may be either, and getting it wrong means the endpoint
@@ -126,9 +139,12 @@ uplink="${uplink:-none}"
 
 country="${selector:0:2}"
 if [ "${#selector}" -eq 2 ]; then
-    mode="random";   server="";         stem="${country}-random"
+    mode="random";   server="";         stem="${country}-random${instance}"
 else
     mode="specific"; server="$selector"; stem="$server"
+    # Silently ignoring it would leave two configs differing only by a field
+    # that has no effect deriving the same qube name.
+    [ -z "${seen[instance]+x}" ] || die "instance is only valid with a country-only selector; '$selector' names one server"
 fi
 
 dvm_template="${provider}-${stem}-vpn-dvm"

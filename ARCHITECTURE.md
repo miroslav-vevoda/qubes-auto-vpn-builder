@@ -93,7 +93,8 @@ differently:
   `key=value` file in `salt-configs-vm`, pulled by `vpn-params-fetch` and
   validated against a strict pattern before use (e.g. `protocol` must be
   `wireguard` or `openvpn`, `transport` must be `udp` or `tcp`, `mtu` must
-  fall in `[1280, 1500]`, the selector must match `^[a-z]{2}([0-9]{1,4})?$`).
+  fall in `[1280, 1500]`, the selector must match `^[a-z]{2}([0-9]{1,4})?$`,
+  `instance` must be 1-99 and is only accepted with a country-only selector).
   Anything that doesn't match aborts the build. The same validation applies
   to `endpoint-map.txt` lines before they reach a `qvm-firewall` command
   line, including rejecting octets with leading zeros — `010.0.0.1` is
@@ -169,11 +170,44 @@ differently:
 
 ## 3. Qube creation and naming
 
-Qube names are derived from the config filename:
-`uk123.nordvpn.com.conf` → `nordvpn-uk123-vpn-dvm` / `nordvpn-uk123-vpn`
-(provider first, then server, `.com` dropped). A country-only selection
-(no specific server) produces `nordvpn-uk-random-vpn-dvm` /
-`nordvpn-uk-random-vpn`.
+Qube names are derived in `vpn-params-fetch` from two fields of the selection
+file — `provider` and `selector` — and from nothing else. Not from the config
+filename: dom0 never sees one, and the name has to be known before any config
+is delivered, because the firewall is applied to the disposable first (§5).
+
+```
+stem = <selector>                       when the selector names a server
+     = <iso>-random<instance>           when it is a country code alone
+
+dvm_template = <provider>-<stem>-vpn-dvm
+dispvm       = <provider>-<stem>-vpn
+```
+
+The selector's *length* selects the mode: two characters is a country, longer
+is one server. So `uk123` gives `nordvpn-uk123-vpn`, and `uk` gives
+`nordvpn-uk-random1-vpn`.
+
+**Random qubes carry an instance number from the first one.** `instance`
+defaults to `1`, so there is never a bare `…-uk-random-vpn`. Two reasons, and
+the second is the operative one: an unnumbered name reads as though a number
+was forgotten, and renaming a qube after the fact means re-pointing the `netvm`
+of everything downstream of it — Qubes stores that reference by name, so the
+rename does not follow. Numbering from the start makes a second random qube for
+the same country a new config file rather than a migration.
+
+`instance` is rejected with a specific selector rather than ignored: a server
+already names itself uniquely, so accepting a field with no effect there would
+let two configs differing only by that field derive one qube name.
+
+Note that `provider` is naming only. Configs are located by country alone
+(`/home/user/configs/<country>/` in `vpn-config-files-vm`), so varying
+`provider` does not give two independent random qubes for one country — it
+gives two qubes drawing from the same folder under different names. `instance`
+is the field for that.
+
+Both names are length-checked against the 31-character qube-name limit and the
+build aborts with the derived name rather than truncating it. `-random<N>`
+costs 8 characters, so random mode plus a long provider is where that bites.
 
 Two qubes are created per selection:
 
@@ -224,6 +258,44 @@ Two qubes are created per selection:
 `network-manager` is left off the VPN qube: its uplink is a Qubes vif, not
 an NM-managed device, so NetworkManager is unneeded attack surface. It's
 only needed on `sys-net`.
+
+### Re-running a build against qubes that already exist
+
+`qvm.present` is idempotent, so a rebuild converges rather than recreating:
+the qubes are found, and `qvm.prefs`/`qvm.tags`/`qvm.service` re-assert their
+settings in place. Nothing is destroyed, so the disposable keeps its identity
+and every qube using it as `netvm` keeps working — the reference is by name,
+and the name is a pure function of `provider` and `selector`.
+
+**The disposable must not be running.** `vpn-build` refuses, and lists the
+qubes that will lose network while it is down; `vpn-build-all` checks the whole
+set during its validation phase, before touching anything. The reason is that a
+rebuild against a live disposable is inconsistent in a way that leaves it worse
+than before:
+
+- Configs are delivered to the **template**. A named disposable copies the
+  private volume at boot, so a running one keeps the configs it started with.
+  The rebuild reports success and changes nothing about what is running.
+- The firewall is applied to the **disposable**, and its netvm enforces the new
+  ruleset immediately. Rebuilding for a different country therefore withdraws
+  the endpoint the live tunnel is using — killing an established tunnel, with
+  `vpn-up` not re-run to replace it.
+
+So the qube stops working, downstream qubes lose the network, and nothing
+reports a cause. Layer 1 holds throughout, so this is an outage and not a leak,
+but only a restart recovers it. Requiring the shutdown up front turns a silent
+half-applied state into a precondition.
+
+What a rebuild does **not** do is clean the template beyond the config
+directory. Salt's `file.managed` states overwrite the files they own and never
+remove others, so a script orphaned by a version upgrade persists. Recreating
+the template each build would close that, but the template cannot be removed
+while the disposable exists, and the disposable cannot be removed without
+detaching every downstream qube first — a cascade that would have to be
+discovered, torn down and restored, with durable state to recover from if the
+build failed midway. Clearing `/rw/config/vpn` in step 7 addresses the case
+that actually recurs; the orphan case belongs to package upgrades, where
+`rpm -V` already reports it.
 
 ## 4. The firewall: two independent layers
 
@@ -426,7 +498,14 @@ Running `vpn-build` in dom0:
    qube-to-qube copy in §2. The contents do not pass through dom0 — see §2 for
    what that does and does not buy.
 7. **Secure the delivered files** — move them out of the template's
-   `~/QubesIncoming` into root-owned `0700` storage at `0600`.
+   `~/QubesIncoming` into root-owned `0700` storage at `0600`, after deleting
+   the configs a previous build left there. Only `*.conf` needs deleting:
+   `endpoint-map.txt` and `auth-user-pass.txt` have fixed names and are
+   overwritten by the move, so they cannot go stale, whereas config filenames
+   vary per server and would otherwise accumulate. Conditional on replacements
+   having arrived in the inbox — a push that reported success but delivered
+   nothing must leave the qube with the configs it had, since this runs as root
+   against a directory holding key material.
 8. **Reconcile the delivered configs against the whitelist**, then shut the
    template back down, since the copy is what started it. Counted inside the
    template because that is the only place both sets exist; the counts are
@@ -482,6 +561,15 @@ Because the VPN qube is a disposable, this runs fresh every time:
 1. `vpn-up` picks a config — the specific server chosen, or a random one from
    the country's whitelisted subset (see §5). The draw is fresh each boot, so a
    disposable restarted does not land on the same server.
+
+   In specific mode the config is matched **by name** against `SERVER` in
+   `vpn-params`, not taken as "the only one present". The old positional pick
+   was correct only while that delivery was guaranteed to hold a single file; a
+   config left by an earlier build broke it silently, because the glob is
+   sorted and an older server sorting first would be chosen and then aimed at
+   an endpoint dom0 no longer whitelists. Step 7 now clears those, so this is
+   the second line of defence — and the one that turns the failure into a
+   message naming the missing server rather than an unexplained dead tunnel.
 2. It's installed under a fixed filename regardless of the original
    provider filename (`/etc/wireguard/wireguard.conf` or
    `/etc/openvpn/client/vpn.conf`), mode `0600` in both cases — configs

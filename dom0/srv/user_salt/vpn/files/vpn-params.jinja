@@ -3,4 +3,8 @@ PROTOCOL={{ protocol }}
 TRANSPORT={{ transport }}
 MTU={{ mtu }}
 MODE={{ mode }}
+# The server stem named in the selection file, e.g. "uk123". Empty in random
+# mode. vpn-up uses it to pick the config BY NAME rather than trusting that
+# exactly one was delivered.
+SERVER={{ server }}
 VPN_IF={{ vpn_if }}

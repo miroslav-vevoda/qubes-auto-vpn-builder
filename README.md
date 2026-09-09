@@ -286,17 +286,54 @@ qubes can reference it by name. Its root filesystem is discarded and recreated
 from the template on every start; only the private volume persists, which is
 why an explicit `qvm-prefs` value on it survives resets.
 
+#### How the names are derived
+
+Two fields decide both names — `provider` and `selector`:
+
+| `provider` | `selector` | `instance` | mode | qubes created |
+|---|---|---|---|---|
+| `nordvpn` | `uk123` | — | specific | `nordvpn-uk123-vpn-dvm`, `nordvpn-uk123-vpn` |
+| `nordvpn` | `uk` | *(omitted)* | random | `nordvpn-uk-random1-vpn-dvm`, `nordvpn-uk-random1-vpn` |
+| `nordvpn` | `uk` | `2` | random | `nordvpn-uk-random2-vpn-dvm`, `nordvpn-uk-random2-vpn` |
+
+The selector's *length* is what picks the mode: two characters means
+country-only and therefore random, longer means one named server.
+
+**Random qubes are always numbered, starting at 1.** `instance=` defaults to
+`1`, so a lone random-UK qube is `nordvpn-uk-random1-vpn` and never a bare
+`nordvpn-uk-random-vpn`. The first one is numbered on purpose — an unnumbered
+name reads as though a number had been forgotten, and renaming it later to make
+room for a second means re-pointing the `netvm` of every qube behind it.
+
+`instance` is only valid with a country-only selector. A specific server
+already names itself uniquely, so setting it alongside `uk123` is an error
+rather than a silently ignored field — otherwise two configs differing only by
+a field with no effect would derive the same qube name.
+
+`provider` is cosmetic as far as *finding* configs goes: it appears only in the
+qube names. Configs are located by country alone, at
+`/home/user/configs/<country>/` in `vpn-config-files-vm`. So varying `provider`
+is not a way to get two independent random qubes for one country — that is what
+`instance` is for.
+
+Names are capped at 31 characters (`vpn-params-fetch:136`). `-random<N>` costs
+8 of them, so a long `provider` plus random mode is where you will hit it; the
+build fails with the derived name rather than truncating it.
+
 ### The build, in order
 
 1. **Read your choice and validate it.** `vpn-params-fetch` pulls the settings
    file from `salt-configs-vm` and checks every value against a strict pattern
    — protocol must be `wireguard` or `openvpn`, transport `udp` or `tcp`, MTU
-   within `[1280, 1500]`, the selector `^[a-z]{2}([0-9]{1,4})?$`. Anything that
-   doesn't match aborts the build rather than falling back to a default. The
+   within `[1280, 1500]`, the selector `^[a-z]{2}([0-9]{1,4})?$`, `instance`
+   1-99. Anything that doesn't match aborts the build rather than falling back
+   to a default. The
    validated values are written to dom0's pillar, which is how they reach the
    salt states.
 2. **Derive the names and create both qubes.** `uk123` becomes
-   `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`. The AppVM template gets
+   `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`; a country-only `uk` becomes
+   `nordvpn-uk-random1-vpn-dvm` and `nordvpn-uk-random1-vpn`. **The build
+   refuses to start if the disposable is already running** — see below. The AppVM template gets
    `netvm = none` unconditionally, plus `provides_network`, the `vpn-endpoint`
    tag, the `qubes-firewall` service enabled and `network-manager` disabled.
    The disposable gets the same tag, `provides_network`, `autostart false`,
@@ -332,8 +369,16 @@ why an explicit `qvm-prefs` value on it survives resets.
    `auth-user-pass.txt` too if your provider needs credentials. The contents
    don't pass through dom0, which keeps them out of its disk and logs — not a
    barrier against dom0 itself, which could read them regardless.
-7. **Secure what arrived.** The files are moved out of `~/QubesIncoming` into
-   root-owned `0700` storage at `0600` each.
+7. **Secure what arrived, and clear what the last build left.** The files are
+   moved out of `~/QubesIncoming` into root-owned `0700` storage at `0600`
+   each. Configs from a previous build are deleted first, because only `*.conf`
+   filenames vary — `endpoint-map.txt` and `auth-user-pass.txt` have fixed
+   names and are simply overwritten, so they can never go stale, while configs
+   would otherwise pile up. A left-behind config is not harmless: it joins the
+   random pool, and in specific mode it can be the one selected. The delete is
+   conditional on replacements having actually arrived, so a delivery that
+   reported success but landed nothing leaves you with the configs you had
+   rather than none.
 8. **Check every delivered config has a whitelisted endpoint**, then shut the
    template — which the file copy had started — back down. This compares two
    sets that are built independently: the configs that arrived (a `*.conf`
@@ -359,7 +404,11 @@ The disposable boots with a fresh root filesystem from the template, and:
    the Layer 1 nftables rules. With no tunnel interface yet, the chain is
    kill-switch-only — nothing can pass through this qube.
 2. **`rc.local` runs `vpn-up`, which selects a config.** If you named a
-   specific server there is one config and it is used. If you named a country,
+   specific server, the config is chosen **by name** — matched against the
+   `SERVER` value in `vpn-params`, not simply "the only one there". If it is
+   missing, the qube stays kill-switched and says so, rather than starting the
+   alphabetically-first config it happens to find and failing against a
+   firewall that never whitelisted it. If you named a country,
    one is picked at random from those delivered — a fresh draw at every start,
    so the same disposable does not keep using the same server.
 
@@ -438,6 +487,42 @@ qvm-prefs <some-qube> netvm <provider>-<sel>-vpn
 
 Every subsequent start repeats steps 1–8 from scratch. Nothing accumulates in
 the disposable, and a broken tunnel is fixed by restarting it.
+
+### Rebuilding an existing qube
+
+Re-running the build with the same `provider` and `selector` produces the same
+two names, so nothing is recreated: `qvm.present` finds the qubes and Salt
+re-asserts their settings in place. Qubes downstream of the disposable keep
+their `netvm` pointing at it, because the name never changed.
+
+**The disposable must be shut down first.** The build refuses otherwise, and
+names the qubes that will lose network while it is down:
+
+```
+vpn-build: nordvpn-uk-random1-vpn is running. Shut it down before rebuilding:
+  qvm-shutdown --wait nordvpn-uk-random1-vpn
+
+These qubes use it as their uplink and will lose network while it is down:
+  work personal dev
+```
+
+That is not caution for its own sake — rebuilding a running qube is broken in
+both directions at once. Configs are delivered to the *template*, and a running
+disposable took its copy of the private volume at boot, so it keeps the old
+ones: the rebuild appears to succeed and changes nothing about what is running.
+The firewall, meanwhile, is applied to the *disposable* and enforced by its
+netvm immediately — so rebuilding for a different country drops the endpoint
+the live tunnel is using, killing an established tunnel that `vpn-up` is not
+re-run to replace. The result is a working qube that stops working, with
+nothing saying why. Nothing leaks, but only a restart recovers it.
+
+`vpn-build-all` checks the whole set for this up front, before building
+anything, rather than failing on the third qube of five and leaving the first
+two rebuilt.
+
+So the procedure is: shut the disposable down, rebuild, start it again, and
+expect downstream qubes to be offline in between. In a chain, shutting down a
+middle qube takes out everything behind it too, so work from the outside in.
 
 ## Seeing the status
 
@@ -973,6 +1058,42 @@ configs in the *same* folder under a single global `transport=udp` — the case
 the third column exists for — and to fall back to `transport=` in both
 directions on a two-column map. A missing `auth-user-pass.txt` stops after one
 attempt rather than three.
+
+**Rebuild safety and naming** (same qube, same method).
+
+`vpn-params-fetch` was driven through a stubbed `qvm-run` against eight
+selection files: `instance` omitted gives `-random1`, `instance=2` gives
+`-random2`, a specific selector is unchanged, and `instance` is rejected at
+`0`, `100`, a non-numeric value, and whenever it appears alongside a specific
+selector. The last of those uses the parser's own duplicate-key map to tell an
+explicit `instance=1` from the default, so it cannot be smuggled past.
+
+Step 7's wipe was tested by extracting the real `qvm-run` body and running it
+against fixture directories: new configs replace old ones, `endpoint-map.txt`
+is overwritten with the new content, an inbox with no `*.conf` leaves existing
+configs in place and logs why, a first build works from empty, and — the case
+that matters most — an `auth-user-pass.txt` that was *not* re-sent survives,
+because only `*.conf` is ever deleted.
+
+`vpn-up`'s by-name selection was tested with a stale config present, a clean
+single-config delivery, the named server absent, two provider variants matching
+one stem, and `SERVER` unset. The stale case was run against **both** the
+committed and the patched script from one fixture: the old code selected
+`uk123` when `SERVER=uk456`, the new code selects `uk456`. That is the bug,
+reproduced and then shown fixed rather than asserted.
+
+The running-disposable guard was extracted and driven with a stubbed
+`qvm-check`/`qvm-ls`: it passes through silently when the qube is down, and
+when it is up it refuses, prints the shutdown command, and lists the downstream
+qubes — omitting that list when there are none.
+
+**Not verified:** `qvm-check --running` and the `qvm-ls --raw-data --fields
+NAME,NETVM` output format are taken from the Qubes documentation, not
+observed — the authoring qube is not dom0, so both were stubbed. If the field
+separator differs, the guard still refuses correctly but the downstream list
+comes out empty. Nothing was tested against a real Salt run, so `qvm.present`
+converging rather than recreating is likewise reasoned from the Salt module's
+documented behaviour.
 
 **Not verified:** none of this has faced a real peer. The handshake check, the
 `openvpn-client@vpn` unit query and the interface-disappearance wait were

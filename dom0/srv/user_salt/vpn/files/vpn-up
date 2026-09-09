@@ -127,7 +127,47 @@ if [ "$MODE" = "random" ]; then
     # draws from it and removes each draw, so a dead server is never retried.
     :
 else
-    set -- "$1"
+    # Specific mode: use the config the selection file NAMED, not whatever the
+    # sorted glob happened to leave in $1.
+    #
+    # Trusting $1 was only correct while a specific-mode delivery was
+    # guaranteed to hold exactly one config. A config left behind by an earlier
+    # build breaks that guarantee: the glob is sorted, so an older server whose
+    # name sorts first gets chosen, is aimed at an endpoint dom0 no longer
+    # whitelists, and the tunnel fails with nothing pointing at the cause.
+    # vpn-build now clears old configs, so this is the second line of defence
+    # -- and the one that turns the failure into a message naming the problem.
+    SERVER="${SERVER:-}"
+    if [ -z "$SERVER" ]; then
+        log "WARNING: MODE=specific but SERVER is unset in vpn-params"
+        log "using the first config; re-run vpn-build to regenerate vpn-params"
+        set -- "$1"
+    else
+        spec_total=$#
+        spec_i=0
+        while [ "$spec_i" -lt "$spec_total" ]; do
+            cand=$1
+            shift
+            # Quoted so the stem is literal; the trailing .* is the glob. A
+            # config is named "<stem>.<provider domain>.conf".
+            case "${cand##*/}" in
+                "$SERVER".*) set -- "$@" "$cand" ;;
+            esac
+            spec_i=$((spec_i + 1))
+        done
+
+        if [ "$#" -eq 0 ]; then
+            log "none of $spec_total delivered configs is for server '$SERVER' - qube stays kill-switched"
+            log "re-run vpn-build: either it was not delivered, or an earlier build left other configs here"
+            exit 1
+        fi
+        if [ "$#" -gt 1 ]; then
+            # A provider shipping a second variant, e.g. uk123.prov.com.conf
+            # alongside uk123.prov.com.tcp.conf. Say which one is in use.
+            log "WARNING: $# configs match '$SERVER' - using ${1##*/}"
+        fi
+        set -- "$1"
+    fi
 fi
 
 # --- how hard to try ---------------------------------------------------------

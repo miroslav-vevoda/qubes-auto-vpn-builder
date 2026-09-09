@@ -256,6 +256,26 @@ if [ "${#existing[@]}" -gt 0 ]; then
     printf '  %s\n' "${existing[@]}"
 fi
 
+# 1f. A running disposable cannot be rebuilt -- vpn-build refuses, for the
+#     reasons given there. Checked for the whole set HERE rather than left to
+#     fail mid-build: this script exists so that a set is validated before
+#     anything is touched, and dying on qube 3 of 5 leaves the first two
+#     rebuilt and the rest not.
+running=()
+for ((i = 0; i < n; i++)); do
+    if qvm-check --running --quiet "${c_disp[$i]}" 2>/dev/null; then
+        running+=("${c_disp[$i]}")
+    fi
+done
+if [ "${#running[@]}" -gt 0 ]; then
+    echo >&2
+    echo "these disposables are running and must be shut down before rebuilding:" >&2
+    printf '  %s\n' "${running[@]}" >&2
+    echo >&2
+    echo "  qvm-shutdown --wait ${running[*]}" >&2
+    die "refusing to rebuild a running qube"
+fi
+
 echo
 echo "all ${n} config(s) validated as a set."
 

@@ -60,6 +60,33 @@ disp=$(read_pillar dispvm)
 [ -n "$transport" ] || die "could not read transport from pillar"
 [ -n "$uplink" ] || die "could not read uplink from pillar"
 
+# Rebuilding a running disposable is broken in both directions, so refuse it
+# rather than half-apply and leave the qube worse than before:
+#
+#   - configs are delivered to the TEMPLATE. A running disposable took its
+#     copy of the private volume at boot, so it keeps the old ones. The
+#     rebuild appears to succeed and changes nothing about what is running.
+#   - the firewall, however, is applied to the disposable and enforced by its
+#     netvm immediately. Rebuilding for a different country therefore drops
+#     the endpoint the live tunnel is using, killing an established tunnel
+#     while vpn-up is not re-run to replace it.
+#
+# Net effect: a working qube stops working, downstream qubes lose the network,
+# and nothing says why. Nothing leaks -- Layer 1 holds -- but a restart is
+# needed to recover, so require it up front instead.
+if qvm-check --running --quiet "$disp" 2>/dev/null; then
+    downstream=$(qvm-ls --raw-data --fields NAME,NETVM 2>/dev/null \
+                 | awk -F'|' -v d="$disp" '$2 == d { print $1 }' | paste -sd' ' -) || downstream=""
+    echo "vpn-build: $disp is running. Shut it down before rebuilding:" >&2
+    echo "  qvm-shutdown --wait $disp" >&2
+    if [ -n "$downstream" ]; then
+        echo >&2
+        echo "These qubes use it as their uplink and will lose network while it is down:" >&2
+        echo "  $downstream" >&2
+    fi
+    exit 1
+fi
+
 step "2/8  create qubes  ($dvm, $disp)"
 qubesctl --show-output state.apply vpn
 
@@ -94,6 +121,26 @@ step "7/8  secure the delivered configs in $dvm"
 qvm-run --no-gui -u root "$dvm" '
     set -e
     mkdir -p /rw/config/vpn && chmod 700 /rw/config/vpn && chown root:root /rw/config/vpn
+
+    # Clear configs left by a previous build before taking delivery of these.
+    #
+    # Only *.conf needs this. endpoint-map.txt and auth-user-pass.txt have
+    # fixed names, so the mv below overwrites them and they can never go
+    # stale; config filenames vary per server, so without this they pile up.
+    # A left-behind config is not inert: it joins the random pool, and in
+    # specific mode it can be the one selected, aimed at an endpoint dom0 no
+    # longer whitelists.
+    #
+    # Guarded on replacements having actually arrived. A push that reported
+    # success but delivered nothing must leave the qube with the configs it
+    # had, not with none -- and this runs as root against a directory holding
+    # key material, so it refuses to be the thing that empties it.
+    if find /home/user/QubesIncoming -type f -name "*.conf" 2>/dev/null | grep -q .; then
+        rm -f /rw/config/vpn/*.conf
+    else
+        echo "no *.conf in the inbox - keeping existing configs" >&2
+    fi
+
     find /home/user/QubesIncoming -type f \
         \( -name "*.conf" -o -name "endpoint-map.txt" -o -name "auth-user-pass.txt" \) \
         -exec mv -t /rw/config/vpn {} + 2>/dev/null || true
