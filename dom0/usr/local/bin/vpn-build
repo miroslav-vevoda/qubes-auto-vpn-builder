@@ -37,6 +37,11 @@ VPNCONF_VM="vpn-config-files-vm"
 # anywhere else fails partway with confusing errors rather than up front.
 [ "$(hostname)" = "dom0" ] || die "must be run in dom0 (hostname is '$(hostname)')"
 
+# Writing the pillar needs root, and so does qubesctl. Checked up front: without
+# this the first failure is a bare "Permission denied" from a redirect several
+# steps in, which says nothing about what to do. Refuse early and name the fix.
+[ "$(id -u)" -eq 0 ] || die "must be run as root -- try: sudo $0 $*"
+
 # No qrexec call here should be able to hang the build indefinitely. The config
 # push moves real files, so it gets a longer budget than the metadata calls.
 QREXEC_TIMEOUT=120

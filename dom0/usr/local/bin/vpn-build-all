@@ -60,6 +60,15 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# Only the build path needs root -- it calls vpn-build, which writes the pillar
+# and runs qubesctl. "-n" validates through "vpn-params-fetch -n", which writes
+# nothing, so it stays usable unprivileged. Checked here so a five-qube set does
+# not validate for a minute and then fail on the first real write.
+if [ "$check_only" = 0 ]; then
+    [ "$(id -u)" -eq 0 ] \
+        || die "building needs root -- try: sudo $0 $*  (or use -n to validate only)"
+fi
+
 DIR_REL="${1:-vpn-configs}"
 [[ "$DIR_REL" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] \
     || die "bad directory '$DIR_REL' (letters, digits, . _ - and / only)"

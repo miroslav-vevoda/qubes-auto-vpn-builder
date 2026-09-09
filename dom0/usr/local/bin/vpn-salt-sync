@@ -43,6 +43,12 @@ die() { echo "vpn-salt-sync: $*" >&2; exit 1; }
 # and it would either fail confusingly or create a misleading directory.
 [ "$(hostname)" = "dom0" ] || die "must be run in dom0 (hostname is '$(hostname)')"
 
+# Installs into /srv/user_salt, which is root-owned. Without this check the
+# script would fetch, vet, print a whole diff and prompt for confirmation
+# before failing on the first write -- asking you to approve something it
+# cannot do.
+[ "$(id -u)" -eq 0 ] || die "must be run as root -- try: sudo $0 $*"
+
 STAGE=$(mktemp -d /tmp/vpn-salt-sync.XXXXXX)
 chmod 700 "$STAGE"
 trap 'rm -rf "$STAGE"' EXIT

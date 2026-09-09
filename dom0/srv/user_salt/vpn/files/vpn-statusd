@@ -98,32 +98,50 @@ check_firewall() {
         return
     fi
 
-    if ! out=$(nft -a list chain ip qubes custom-forward 2>/dev/null); then
-        # Not an error we can shrug at. No chain means nothing is intercepting
-        # forwarded traffic, and the base chain accepts by policy.
-        fw_state=open
-        fw_detail="custom-forward chain MISSING - base chain is policy accept"
-        return
-    fi
+    # BOTH families, because qubes-firewall-user-script writes both. It does so
+    # deliberately: with IPv6 disabled the ip6 rules match nothing, but if IPv6
+    # is ever turned on -- by you or by a template change -- the kill switch
+    # already covers it. Checking only ip would leave that exact scenario, the
+    # one the ip6 rules exist for, unmonitored: the banner would say ARMED with
+    # the ip6 chain empty and policy accept behind it.
+    #
+    # Worst family wins. "open" anywhere means the kill switch is not intact.
+    _worst=armed
+    _bits=""
+    for _fam in ip ip6; do
+        if ! _out=$(nft -a list chain "$_fam" qubes custom-forward 2>/dev/null); then
+            # No chain means nothing intercepts forwarded traffic and the base
+            # chain accepts by policy. Not something to shrug at.
+            _worst=open
+            _bits="$_bits $_fam:MISSING"
+            continue
+        fi
 
-    # Every rule line carries a "# handle N" comment, and so does the
-    # "chain ... {" line, hence the -1.
-    h=$(printf '%s\n' "$out" | grep -c '# handle ')
-    if [ "$h" -gt 0 ]; then rules=$((h - 1)); else rules=0; fi
+        # Every rule line carries a "# handle N" comment, and so does the
+        # "chain ... {" line, hence the -1.
+        _h=$(printf '%s\n' "$_out" | grep -c '# handle ')
+        if [ "$_h" -gt 0 ]; then _rules=$((_h - 1)); else _rules=0; fi
 
-    # Last line that is neither blank nor a closing brace, with its handle
-    # comment and surrounding space stripped.
-    last=$(printf '%s\n' "$out" \
-           | grep -vE '^[[:space:]]*\}?[[:space:]]*$' \
-           | tail -1 \
-           | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        # Last line that is neither blank nor a closing brace, with its handle
+        # comment and surrounding space stripped.
+        _last=$(printf '%s\n' "$_out" \
+               | grep -vE '^[[:space:]]*\}?[[:space:]]*$' \
+               | tail -1 \
+               | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
-    if [ "$last" = "drop" ]; then
-        fw_state=armed
-        fw_detail="kill switch armed - $rules rules, terminal drop present"
+        if [ "$_last" = "drop" ]; then
+            _bits="$_bits $_fam:${_rules}r+drop"
+        else
+            _worst=open
+            _bits="$_bits $_fam:${_rules}r+NODROP"
+        fi
+    done
+
+    fw_state="$_worst"
+    if [ "$_worst" = armed ]; then
+        fw_detail="kill switch armed -$_bits"
     else
-        fw_state=open
-        fw_detail="KILL SWITCH NOT ARMED - $rules rules, chain does not end in drop"
+        fw_detail="KILL SWITCH NOT ARMED -$_bits"
     fi
 }
 
