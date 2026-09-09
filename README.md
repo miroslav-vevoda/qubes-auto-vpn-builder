@@ -293,15 +293,18 @@ Two fields decide both names — `provider` and `selector`:
 | `provider` | `selector` | `instance` | mode | qubes created |
 |---|---|---|---|---|
 | `nordvpn` | `uk123` | — | specific | `nordvpn-uk123-vpn-dvm`, `nordvpn-uk123-vpn` |
-| `nordvpn` | `uk` | *(omitted)* | random | `nordvpn-uk-random1-vpn-dvm`, `nordvpn-uk-random1-vpn` |
-| `nordvpn` | `uk` | `2` | random | `nordvpn-uk-random2-vpn-dvm`, `nordvpn-uk-random2-vpn` |
+| `nordvpn` | `uk` | *(omitted)* | random | `nordvpn-uk-r1-vpn-dvm`, `nordvpn-uk-r1-vpn` |
+| `nordvpn` | `uk` | `2` | random | `nordvpn-uk-r2-vpn-dvm`, `nordvpn-uk-r2-vpn` |
 
 The selector's *length* is what picks the mode: two characters means
-country-only and therefore random, longer means one named server.
+country-only and therefore random, longer means one named server. The `r` in
+`uk-r1` is for *random* — abbreviated rather than spelled out to keep the
+derived name well clear of the 31-character qube-name limit. It cannot be
+confused with a specific server, because a selector may not contain a dash.
 
 **Random qubes are always numbered, starting at 1.** `instance=` defaults to
-`1`, so a lone random-UK qube is `nordvpn-uk-random1-vpn` and never a bare
-`nordvpn-uk-random-vpn`. The first one is numbered on purpose — an unnumbered
+`1`, so a lone random-UK qube is `nordvpn-uk-r1-vpn` and never a bare
+`nordvpn-uk-r-vpn`. The first one is numbered on purpose — an unnumbered
 name reads as though a number had been forgotten, and renaming it later to make
 room for a second means re-pointing the `netvm` of every qube behind it.
 
@@ -316,9 +319,15 @@ qube names. Configs are located by country alone, at
 is not a way to get two independent random qubes for one country — that is what
 `instance` is for.
 
-Names are capped at 31 characters (`vpn-params-fetch:136`). `-random<N>` costs
-8 of them, so a long `provider` plus random mode is where you will hit it; the
-build fails with the derived name rather than truncating it.
+Names are capped at 31 characters, checked at `vpn-params-fetch:136`, and the
+build aborts printing the derived name rather than truncating it. With `-r<N>`
+there is room to spare — even a maximum-length 16-character `provider` fits:
+
+```
+nordvpn-uk-r1-vpn-dvm              21 ok
+abcdefghijklmnop-uk-r1-vpn-dvm     30 ok
+abcdefghijklmnop-uk-r99-vpn-dvm    31 ok
+```
 
 ### The build, in order
 
@@ -332,7 +341,7 @@ build fails with the derived name rather than truncating it.
    salt states.
 2. **Derive the names and create both qubes.** `uk123` becomes
    `nordvpn-uk123-vpn-dvm` and `nordvpn-uk123-vpn`; a country-only `uk` becomes
-   `nordvpn-uk-random1-vpn-dvm` and `nordvpn-uk-random1-vpn`. **The build
+   `nordvpn-uk-r1-vpn-dvm` and `nordvpn-uk-r1-vpn`. **The build
    refuses to start if the disposable is already running** — see below. The AppVM template gets
    `netvm = none` unconditionally, plus `provides_network`, the `vpn-endpoint`
    tag, the `qubes-firewall` service enabled and `network-manager` disabled.
@@ -499,8 +508,8 @@ their `netvm` pointing at it, because the name never changed.
 names the qubes that will lose network while it is down:
 
 ```
-vpn-build: nordvpn-uk-random1-vpn is running. Shut it down before rebuilding:
-  qvm-shutdown --wait nordvpn-uk-random1-vpn
+vpn-build: nordvpn-uk-r1-vpn is running. Shut it down before rebuilding:
+  qvm-shutdown --wait nordvpn-uk-r1-vpn
 
 These qubes use it as their uplink and will lose network while it is down:
   work personal dev
@@ -1062,8 +1071,8 @@ attempt rather than three.
 **Rebuild safety and naming** (same qube, same method).
 
 `vpn-params-fetch` was driven through a stubbed `qvm-run` against eight
-selection files: `instance` omitted gives `-random1`, `instance=2` gives
-`-random2`, a specific selector is unchanged, and `instance` is rejected at
+selection files: `instance` omitted gives `-r1`, `instance=2` gives
+`-r2`, a specific selector is unchanged, and `instance` is rejected at
 `0`, `100`, a non-numeric value, and whenever it appears alongside a specific
 selector. The last of those uses the parser's own duplicate-key map to tell an
 explicit `instance=1` from the default, so it cannot be smuggled past.

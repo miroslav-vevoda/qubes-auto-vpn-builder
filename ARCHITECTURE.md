@@ -177,7 +177,7 @@ is delivered, because the firewall is applied to the disposable first (§5).
 
 ```
 stem = <selector>                       when the selector names a server
-     = <iso>-random<instance>           when it is a country code alone
+     = <iso>-r<instance>           when it is a country code alone
 
 dvm_template = <provider>-<stem>-vpn-dvm
 dispvm       = <provider>-<stem>-vpn
@@ -185,10 +185,10 @@ dispvm       = <provider>-<stem>-vpn
 
 The selector's *length* selects the mode: two characters is a country, longer
 is one server. So `uk123` gives `nordvpn-uk123-vpn`, and `uk` gives
-`nordvpn-uk-random1-vpn`.
+`nordvpn-uk-r1-vpn`.
 
 **Random qubes carry an instance number from the first one.** `instance`
-defaults to `1`, so there is never a bare `…-uk-random-vpn`. Two reasons, and
+defaults to `1`, so there is never a bare `…-uk-r-vpn`. Two reasons, and
 the second is the operative one: an unnumbered name reads as though a number
 was forgotten, and renaming a qube after the fact means re-pointing the `netvm`
 of everything downstream of it — Qubes stores that reference by name, so the
@@ -205,9 +205,16 @@ Note that `provider` is naming only. Configs are located by country alone
 gives two qubes drawing from the same folder under different names. `instance`
 is the field for that.
 
-Both names are length-checked against the 31-character qube-name limit and the
-build aborts with the derived name rather than truncating it. `-random<N>`
-costs 8 characters, so random mode plus a long provider is where that bites.
+`r` is short for *random*. It is abbreviated rather than spelled out to keep
+the derived name clear of the 31-character qube-name limit, and it cannot be
+mistaken for a specific selector because a selector may not contain a dash --
+`^[a-z]{2}([0-9]{1,4})?$`. So a name with three dashes is always a random qube
+and one with two is always a specific server.
+
+Both names are length-checked against that limit, and the build aborts printing
+the derived name rather than truncating it. `-r<N>` leaves room to spare: even
+a maximum-length 16-character provider fits, at 30 characters for `-r1` and
+exactly 31 for `-r99`.
 
 Two qubes are created per selection:
 

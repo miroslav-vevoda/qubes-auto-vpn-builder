@@ -139,7 +139,7 @@ uplink="${uplink:-none}"
 
 country="${selector:0:2}"
 if [ "${#selector}" -eq 2 ]; then
-    mode="random";   server="";         stem="${country}-random${instance}"
+    mode="random";   server="";         stem="${country}-r${instance}"
 else
     mode="specific"; server="$selector"; stem="$server"
     # Silently ignoring it would leave two configs differing only by a field
