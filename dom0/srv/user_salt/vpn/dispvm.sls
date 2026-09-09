@@ -43,3 +43,30 @@
       - vpn-endpoint
     - require:
       - qvm: {{ v.dispvm }}-prefs
+
+# Set on the disposable EXPLICITLY, not left to inherit from the template.
+#
+# qubes-firewall is what runs qubes-firewall-user-script, and that script is
+# Layer 1 -- the in-qube kill switch. The template it would be inherited from
+# has netvm none and never runs, so enabling it there does nothing except be
+# inherited: the whole of Layer 1 would rest on that inheritance behaving as
+# expected. This file already declines to inherit netvm and provides_network
+# for the same class of reason, and the cost of being wrong is higher here.
+#
+# If inheritance does work, this is redundant and harmless. If it does not,
+# this is the difference between two independent enforcement layers and one --
+# and the difference would be close to invisible, because Layer 2 confines the
+# qube to its endpoint regardless, so the documented kill-switch test would
+# still appear to pass with Layer 1 entirely absent.
+#
+# network-manager stays disabled: the uplink is a Qubes vif, not an
+# NM-managed device, so NM here is attack surface and nothing else.
+{{ v.dispvm }}-services:
+  qvm.service:
+    - name: {{ v.dispvm }}
+    - enable:
+      - qubes-firewall
+    - disable:
+      - network-manager
+    - require:
+      - qvm: {{ v.dispvm }}-tags

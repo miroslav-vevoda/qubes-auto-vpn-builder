@@ -227,12 +227,23 @@ Two qubes are created per selection:
   fail-closed default: anything created from this template without an explicit
   override gets no network path at all.
 - **The named disposable** (`…-vpn`) — created from that template, with
-  `netvm` and `provides_network` set explicitly:
+  `netvm`, `provides_network` and its **services** set explicitly:
 
   ```sh
   qvm-prefs nordvpn-uk123-vpn  netvm            sys-firewall
   qvm-prefs nordvpn-uk123-vpn  provides_network true
   ```
+
+  Services are set here rather than inherited. `qubes-firewall` is what runs
+  `qubes-firewall-user-script`, so Layer 1 depends on it — and the template it
+  would otherwise be inherited from has `netvm none` and never runs, meaning
+  the enable there exists *only* to be inherited. Setting it on the disposable
+  too costs nothing and removes the dependency on that inheritance. The
+  argument for being explicit is how quiet the failure would be: with Layer 1
+  absent, Layer 2 still confines the qube to its endpoint, so the documented
+  kill-switch test would appear to pass while enforcement had dropped from two
+  independent layers to one. `network-manager` is disabled on both qubes,
+  since the uplink is a Qubes vif and not an NM-managed device.
 
   It's a *named* disposable rather than an auto-named `disp####` because
   other qubes need to reference it by name as their `netvm`. An explicit

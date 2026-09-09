@@ -894,6 +894,7 @@ qvm-prefs <disposable> netvm              # the qube named by uplink=, or blank
 qvm-prefs <disposable> provides_network   # True
 qvm-tags  <dvm-template> list             # vpn-endpoint
 qvm-tags  <disposable> list               # vpn-endpoint
+qvm-service <disposable> list             # qubes-firewall on, network-manager off
 qvm-firewall <disposable> list            # last rule is an unconditional drop
 ```
 
@@ -903,6 +904,15 @@ set:
 - **The template's `netvm` is always blank.** `dvmtemplate.sls` sets it to
   `none` unconditionally, and `uplink=` has no bearing on it. If this is not
   blank, something is wrong.
+- **`qubes-firewall` must be on for the *disposable*, not just the template.**
+  It is what runs `qubes-firewall-user-script`, and that script is Layer 1. The
+  build sets it explicitly on both qubes rather than relying on the disposable
+  inheriting it from a template that has `netvm none` and never runs. Worth
+  checking directly, because the failure mode is quiet: with Layer 1 absent,
+  Layer 2 still confines the qube to its endpoint, so the kill-switch test
+  below would appear to pass while you were down to a single layer.
+  `network-manager` should be off — the uplink is a Qubes vif, not an
+  NM-managed device.
 - **The disposable's `netvm` is the qube your `uplink=` named.** It should
   match exactly — normally `sys-firewall`, or another VPN qube's disposable if
   you are chaining. It is blank only if you wrote `uplink=none`. If it is
