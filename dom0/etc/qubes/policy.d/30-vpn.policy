@@ -24,10 +24,27 @@ custom.VpnConfigPush    *  @anyvm    @anyvm               deny
 qubes.Filecopy  *  vpn-config-files-vm  @tag:vpn-endpoint  allow
 qubes.Filecopy  *  vpn-config-files-vm  @anyvm             deny
 
-## The VPN qube holds live key material. Nothing may pull files back out of it.
+## The VPN qube holds live key material. Deny the qrexec routes by which it
+## could hand a file to another qube.
 ##
 ## Both the dvm template AND the named disposable carry the tag (see
-## dvmtemplate.sls and dispvm.sls). Tagging only the template would leave this
-## denial covering a qube that never runs, while the disposable that actually
+## dvmtemplate.sls and dispvm.sls). Tagging only the template would leave these
+## denials covering a qube that never runs, while the disposable that actually
 ## has the keys loaded fell through to 90-default.policy.
+##
+## Filecopy is the obvious route; OpenInVM is the other way a file reaches
+## another qube, and OpenURL is a narrower channel in the same direction.
+## Neither has a legitimate use from a qube whose entire job is to be a netvm.
 qubes.Filecopy  *  @tag:vpn-endpoint    @anyvm             deny
+qubes.OpenInVM  *  @tag:vpn-endpoint    @anyvm             deny
+qubes.OpenURL   *  @tag:vpn-endpoint    @anyvm             deny
+
+## NOT denied, deliberately: the clipboard. Copying a log line out of the VPN
+## qube's terminal is a normal thing to want while debugging a tunnel, and the
+## clipboard is user-driven, one item at a time, and already requires a keypress
+## inside the source qube. Denying it would cost real usability for very little
+## against an attacker who already has code running in there.
+##
+## So read the rules above as "no file leaves this qube over qrexec" -- not as
+## "no byte can ever get out". The network path is closed by the firewall, not
+## by policy; see ARCHITECTURE.md section 4.

@@ -48,6 +48,15 @@ __vpn_status_read() {
 
     # vpn-statusd rewrites every 30s; 150s is five missed cycles.
     __vpn_age=$(( $(date +%s) - __vpn_ts ))
+    # A timestamp in the future gives a negative age, which is never "> 150",
+    # so without this a stale file would read as fresh indefinitely. Reachable
+    # with no attacker at all: a disposable that writes a status before the
+    # clock settles, then time steps backwards.
+    if [ "$__vpn_age" -lt 0 ]; then
+        __vpn_state=stale
+        __vpn_armed=stale
+        return 2
+    fi
     if [ "$__vpn_age" -gt 150 ]; then
         __vpn_state=stale
         __vpn_armed=stale

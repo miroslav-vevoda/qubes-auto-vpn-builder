@@ -58,7 +58,10 @@
 set -u
 
 STATUS=/run/vpn-status
-TMP=/run/.vpn-status.$$
+# Created per cycle by mktemp, below. /run is root-only, so the old
+# "$$"-derived name was not exploitable -- but mktemp costs nothing and takes
+# the question off the table. Empty until the first cycle sets it.
+TMP=""
 SELECTED=/run/vpn-selected
 INTERVAL=30
 
@@ -67,7 +70,7 @@ INTERVAL=30
 # cycles: long enough not to flap on an idle link, short enough to notice.
 WG_STALE=180
 
-trap 'rm -f "$TMP"; exit 0' INT TERM
+trap '[ -n "$TMP" ] && rm -f "$TMP"; exit 0' INT TERM
 
 # Reduce an untrusted string to printable ASCII, collapse runs of anything
 # else to a single space, and cap the length. Without this a .conf filename
@@ -223,14 +226,23 @@ while :; do
 
     # Write to a temp file and rename. Rename within one filesystem is atomic,
     # so a reader can never catch a half-written status.
+    #
+    # A fresh name per cycle, not one reused: the rename below consumes the
+    # file, so reusing a fixed path would recreate it by redirection and lose
+    # the unpredictability mktemp is here for.
+    TMP=$(mktemp /run/.vpn-status.XXXXXX 2>/dev/null) \
+        || { sleep "$INTERVAL"; continue; }
     {
         printf '%s %s %s\n' "$tun_state" "$fw_state" "$(date +%s)"
         printf '%s\n' "$tun_detail"
         printf '%s\n' "$fw_detail"
-    } > "$TMP" || { sleep "$INTERVAL"; continue; }
+    } > "$TMP" || { rm -f "$TMP"; sleep "$INTERVAL"; continue; }
 
     chmod 0644 "$TMP" 2>/dev/null
     mv -f "$TMP" "$STATUS" 2>/dev/null
+    # No-op when the rename succeeded (the path is gone); cleans up when it did
+    # not, so a failing mv cannot leak a temp file every 30 seconds.
+    rm -f "$TMP" 2>/dev/null
 
     sleep "$INTERVAL"
 done

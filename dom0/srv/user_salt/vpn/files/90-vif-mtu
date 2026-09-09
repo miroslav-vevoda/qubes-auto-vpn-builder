@@ -16,8 +16,14 @@ vif="$2"
 
 case "$vif" in
     vif[0-9]*)
-        ip link set dev "$vif" mtu "$MTU"
-        logger -t vpn-vif-mtu "set $vif mtu $MTU"
+        # Report what actually happened. MTU is the setting whose failure is
+        # silent -- small packets work, large ones vanish -- so a log line
+        # claiming success when the command failed is the worst kind of wrong.
+        if ip link set dev "$vif" mtu "$MTU"; then
+            logger -t vpn-vif-mtu "set $vif mtu $MTU"
+        else
+            logger -t vpn-vif-mtu "FAILED to set $vif mtu $MTU"
+        fi
         ;;
 esac
 exit 0

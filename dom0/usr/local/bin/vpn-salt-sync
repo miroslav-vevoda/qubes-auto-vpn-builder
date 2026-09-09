@@ -83,8 +83,10 @@ Install top.sls and anything else by hand; it decides what runs in dom0."
 # against a live dom0 path. Symlinks were rejected above, so these cannot be
 # redirected.
 
-find "$STAGE" -type d -exec chmod 755 {} +
-find "$STAGE" -type f -exec chmod 644 {} +
+# -mindepth 1, or $STAGE itself is included and goes 700 -> 755, undoing the
+# chmod above for the lifetime of the run.
+find "$STAGE" -mindepth 1 -type d -exec chmod 755 {} +
+find "$STAGE" -mindepth 1 -type f -exec chmod 644 {} +
 for f in qubes-firewall-user-script 90-vif-mtu vpn-up rc.local; do
     [ -f "$STAGE/$SUBTREE/files/$f" ] || die "archive is missing $SUBTREE/files/$f"
     chmod 755 "$STAGE/$SUBTREE/files/$f"

@@ -149,10 +149,23 @@ qvm-run --no-gui -u root "$dvm" '
     find /home/user/QubesIncoming -type f \
         \( -name "*.conf" -o -name "endpoint-map.txt" -o -name "auth-user-pass.txt" \) \
         -exec mv -t /rw/config/vpn {} + 2>/dev/null || true
-    chown root:root /rw/config/vpn/* 2>/dev/null || true
-    chmod 600 /rw/config/vpn/*.conf 2>/dev/null || true
-    chmod 600 /rw/config/vpn/auth-user-pass.txt 2>/dev/null || true
-    chmod 644 /rw/config/vpn/endpoint-map.txt 2>/dev/null || true
+    # Filter on -type f rather than globbing. chmod and chown FOLLOW symlinks,
+    # and the "find -type f" above only proves the type at the moment find
+    # looked: a malicious user in this template could swap a regular file for a
+    # symlink before mv renames it, landing a symlink in this directory and
+    # having the chmod below re-mode an arbitrary path as root. Re-checking here
+    # closes that -- once a file is inside 0700 root-owned storage, an
+    # unprivileged user can no longer swap it.
+    find /rw/config/vpn -maxdepth 1 -type f \
+        -exec chown root:root {} + 2>/dev/null || true
+    find /rw/config/vpn -maxdepth 1 -type f -name "*.conf" \
+        -exec chmod 600 {} + 2>/dev/null || true
+    find /rw/config/vpn -maxdepth 1 -type f -name auth-user-pass.txt \
+        -exec chmod 600 {} + 2>/dev/null || true
+    find /rw/config/vpn -maxdepth 1 -type f -name endpoint-map.txt \
+        -exec chmod 644 {} + 2>/dev/null || true
+    # Nothing but regular files belongs here, and the copy above put none there.
+    find /rw/config/vpn -maxdepth 1 ! -type f ! -type d -delete 2>/dev/null || true
     rm -rf /home/user/QubesIncoming
 ' || die "could not secure configs inside $dvm"
 
